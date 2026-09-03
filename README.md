@@ -41,9 +41,20 @@ friends), which it normally ships in its own folder. If those go missing the
 game will not start, with or without this wrapper.
 
 Fix it in Steam first: **right-click the game → Properties → Installed Files →
-Verify integrity of game files.** That restores the game's own copies. Failing
-that, install the **Microsoft Visual C++ 2010 Redistributable (x86)** from
-Microsoft.
+Verify integrity of game files.** That restores the game's own copies and is
+almost always the whole answer.
+
+If you would rather install the runtimes properly, note that the files the game
+wants come from **two different Microsoft packages**, which is easy to get
+wrong:
+
+| Missing file | Comes from |
+| --- | --- |
+| `MSVCR100.dll`, `MSVCP100.dll` | [Visual C++ 2010 SP1 Redistributable (x86)](https://www.microsoft.com/en-us/download/details.aspx?id=26999) |
+| `d3dx9_43.dll`, `d3dcompiler_43.dll`, `XINPUT1_3.dll` | [DirectX End-User Runtime (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=35) |
+
+Installing only the Visual C++ package leaves the DirectX files missing, and the
+game fails the same way, which makes it look like the first fix did nothing.
 
 This project deliberately does not bundle those DLLs. They are Microsoft's
 copy written files, not mine, and you should get them from Microsoft or from Steam rather

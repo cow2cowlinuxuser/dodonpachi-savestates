@@ -57,8 +57,8 @@ Installing only the Visual C++ package leaves the DirectX files missing, and the
 game fails the same way, which makes it look like the first fix did nothing.
 
 This project deliberately does not bundle those DLLs. They are Microsoft's
-copy written files, not mine, and you should get them from Microsoft or from Steam rather
-than from a stranger on the internet.
+copyrighted files, not mine, and you should get them from Microsoft or from
+Steam rather than from a stranger on the internet.
 
 ## What it actually is
 

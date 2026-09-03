@@ -12,6 +12,10 @@ if (-not $zig) {
   Write-Error "zig not found. Install from https://ziglang.org/download/ and put it on PATH, or set `$env:ZIG."
 }
 
+# Printed so that a build log pasted into a bug report says which compiler
+# produced it, which is the first thing anyone would otherwise have to ask.
+Write-Host "using $zig (zig $(& $zig version))"
+
 $warn = @("-O2", "-Wall", "-Wno-incompatible-function-pointer-types")
 $src = @(
   "src/d3d9_sw.c", "src/swrast.c", "src/savestate.c", "src/vsinterp.c",

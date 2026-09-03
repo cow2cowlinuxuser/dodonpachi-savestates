@@ -112,8 +112,15 @@ ready to drop in. Build it only if you would rather not run a binary you did not
 compile — which is a perfectly reasonable thing to want.
 
 Requires [zig](https://ziglang.org/download/), used only as a C compiler because
-it cross-compiles to 32-bit Windows with no SDK install. Any clang that can
-target `i386-windows-gnu` would do. There is nothing else to install.
+it cross-compiles to 32-bit Windows with no SDK install. There is nothing else
+to install — no Visual Studio, no Windows SDK.
+
+Built and tested with **zig 0.15.2** (clang 20.1.2). Other versions should be
+fine: nothing here uses zig's build system or its language, only `zig cc`, which
+is a clang driver, so the churn between zig releases mostly does not apply. The
+one real floor is zig 0.11, which is when the target triple became
+`x86-windows-gnu` rather than `i386-windows-gnu`. Any clang that can target
+32-bit mingw-w64 works just as well if you would rather not install zig.
 
 Then double-click **`build.cmd`**, or from a terminal:
 

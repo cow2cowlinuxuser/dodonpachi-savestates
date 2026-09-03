@@ -1,0 +1,16 @@
+build/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.o
+
+# Runtime output from the wrapper itself
+d3d9_sw*.log
+d3d9_sw*.txt
+d3d9_sw*.tga
+*.dmp
+
+.vs/
+.vscode/

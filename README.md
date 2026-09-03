@@ -93,6 +93,11 @@ the rasteriser is multithreaded and uses SSE2/AVX2 where available.
   is held still while it happens rather than being allowed to run on half-built
   state, so it is a pause rather than a glitch, but it is noticeable. Reducing
   it is a job for a later version.
+- **Maximizing the window is not finished.** `D3D9SW_RESIZABLE=1` adds the
+  maximize button and a drag-resizable frame, and the scaling side works, but
+  maximize is one-way: the restore button greys out afterwards. Making it behave
+  needs the wrapper to own the window's messages, which is a bigger commitment
+  than the feature is worth so far. Off by default. Use Alt+Enter instead.
 - **Some graphical artifacts remain.** A small number of shared triangle edges
   leak a pixel or two, which `test_seam.exe` reports as a known issue rather
   than hiding. Nothing that affects play, but it is there and it is tracked.
@@ -130,9 +135,8 @@ away, scaling by the largest whole multiple that fits and putting black bars
 around the rest. There is no third option that is both sharp and gap-free; the
 arithmetic does not allow one.
 
-The window can also be resized and maximized, which the game does not normally
-permit. Since the render size is fixed and only the final scale changes, a
-maximized window costs no more to draw than a small one.
+Since the render size is fixed and only the final scale changes, the size of the
+window costs nothing to draw.
 
 ## The one game bug this fixes
 
@@ -229,7 +233,7 @@ tell whether a change took effect.
 | `D3D9SW_SCALE=integer` | Scale by whole multiples only, with black bars, instead of filling the window. |
 | `D3D9SW_DPI=0` | Do not claim DPI awareness, and let Windows scale the output instead. |
 | `D3D9SW_ALTENTER=0` | Disable the Alt+Enter fullscreen toggle. |
-| `D3D9SW_RESIZABLE=0` | Leave the game's window fixed-size as shipped, with no maximize button. |
+| `D3D9SW_RESIZABLE=1` | Add maximize and drag-to-resize to the game's fixed-size window. Incomplete: maximize sticks, see below. |
 
 ## On the use of AI
 

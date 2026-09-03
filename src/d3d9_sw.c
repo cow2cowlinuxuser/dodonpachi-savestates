@@ -6462,18 +6462,21 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *this, UINT adapter, D3DDEVTYP
 		_snprintf(msg, sizeof(msg), "layout: %dx%d (render size for this device)", w, h);
 		sw_log(msg);
 	}
-	/* Let the window be maximized and dragged to a size.
+	/* Let the window be maximized and dragged to a size. Off by default,
+	 * because handing Windows the style bits is not enough on its own.
 	 *
-	 * The game ships a fixed-size window because a real D3D9 device would
-	 * have to be reset to follow one, and it would rather not. Nothing here
-	 * cares: the render size is pinned to the layout above and present scales
-	 * it to whatever the client area happens to be, so a maximized window is
-	 * the same work as a small one and needs no cooperation from the game.
+	 * Scaling to a maximized window is free - the render size is pinned to
+	 * the layout above and only the final blit changes - so the drawing side
+	 * of this works. The window management side does not: maximize once and
+	 * the restore button greys out, the window having lost the placement it
+	 * would go back to. Fixing that means owning the window's messages, and
+	 * subclassing someone else's window is a far larger commitment than a
+	 * convenience feature justifies - it has to survive the game's own
+	 * handler, device resets and a process that may die without unhooking.
 	 *
-	 * Only the frame bits, and only while windowed - this is not fullscreen
-	 * and deliberately keeps the title bar, the taskbar and the other
-	 * monitor. D3D9SW_RESIZABLE=0 to leave the window exactly as shipped. */
-	if (pp->Windowed && env_flag("D3D9SW_RESIZABLE", 1) && hwnd && IsWindow(hwnd)) {
+	 * Left in, opt-in, so the next attempt starts from here rather than from
+	 * nothing: D3D9SW_RESIZABLE=1, and expect the maximize button to stick. */
+	if (pp->Windowed && env_flag("D3D9SW_RESIZABLE", 0) && hwnd && IsWindow(hwnd)) {
 		LONG s = GetWindowLongA(hwnd, GWL_STYLE);
 		if ((s & (WS_THICKFRAME | WS_MAXIMIZEBOX)) != (WS_THICKFRAME | WS_MAXIMIZEBOX)) {
 			SetWindowLongA(hwnd, GWL_STYLE, s | WS_THICKFRAME | WS_MAXIMIZEBOX);

@@ -16,7 +16,11 @@ the wrapper sits between it and Direct3D.
 | --- | --- |
 | `F5` | Save state |
 | `Shift` + `F5` | Restore it |
+| `Alt` + `Enter` | Toggle borderless fullscreen |
 | `F9` | Lossless screen capture, for reporting rendering bugs |
+
+Hotkeys only act while the game is the focused window, so they will not fire
+while you are in another application.
 
 There is currently **one** slot. The hotkey handler is written for `F5`
 onwards and will light up `F6`–`F8` the moment `SAVESTATE_SLOTS` in
@@ -51,7 +55,7 @@ wrong:
 | Missing file | Comes from |
 | --- | --- |
 | `MSVCR100.dll`, `MSVCP100.dll` | [Visual C++ 2010 SP1 Redistributable (x86)](https://www.microsoft.com/en-us/download/details.aspx?id=26999) |
-| `d3dx9_43.dll`, `d3dcompiler_43.dll`, `XINPUT1_3.dll` | [DirectX End-User Runtime (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=35) |
+| `d3dx9_43.dll`, `d3dcompiler_43.dll`, `XINPUT1_3.dll` | [DirectX End-User Runtime (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=8109) |
 
 Installing only the Visual C++ package leaves the DirectX files missing, and the
 game fails the same way, which makes it look like the first fix did nothing.
@@ -83,14 +87,52 @@ the rasteriser is multithreaded and uses SSE2/AVX2 where available.
   process. In practice this means an occasional restore that does nothing.
 - **Audio does not always follow a restore.** A track loaded at save time may
   not resume correctly. Gameplay is unaffected.
-- **Exclusive fullscreen is not implemented.** The wrapper never performs a
-  display mode switch, so a fullscreen request is ignored and the game keeps
-  presenting into a window. Run it windowed. Borderless would not need a mode
-  switch and is the obvious next step.
+- **Changing the window size stalls the game briefly.** Resizing, maximizing or
+  toggling fullscreen makes the game rebuild its device resources, one of which
+  is a 4096x4096 texture, and that is not quick to reconvert on a CPU. The game
+  is held still while it happens rather than being allowed to run on half-built
+  state, so it is a pause rather than a glitch, but it is noticeable. Reducing
+  it is a job for a later version.
+- **Some graphical artifacts remain.** A small number of shared triangle edges
+  leak a pixel or two, which `test_seam.exe` reports as a known issue rather
+  than hiding. Nothing that affects play, but it is there and it is tracked.
+- **Exclusive fullscreen is still not implemented,** and will not be. Fullscreen
+  here is borderless: the window is stretched over the monitor with no display
+  mode switch, which is what you want anyway on a modern desktop. It means no
+  mode-change flicker, working alt-tab, and no chance of leaving the display in
+  a bad state if the game dies. Alt+Enter toggles it.
 - **The frame rate paces the game, not just the display.** On a CPU that cannot
   hold 60, the game runs slower rather than dropping frames.
 - **Not a speedrun tool.** Frame timing is not cycle-accurate and this is not a
   substitute for real hardware or a verified emulator.
+- **Tested on a small number of machines.** It has been stable on every system
+  it has run on, but that is a handful of Windows 10 and 11 desktops and a
+  laptop, all with the same handful of GPUs. Treat "stable" as unproven
+  elsewhere rather than guaranteed, and open an issue if your machine disagrees.
+
+## Display and scaling
+
+The game renders at the size it was configured for and the finished frame is
+scaled to the window, using nearest-neighbour so the art stays sharp rather than
+being smeared by a filter.
+
+The wrapper declares itself DPI-aware, which matters more than it sounds. On a
+display scaled above 100% a process that does not say this is handed fake
+coordinates and Windows quietly stretches its output up to the real panel with a
+blur nobody asked for — so the picture would be resampled twice, once by us and
+once by the compositor. Declaring awareness leaves exactly one scale, ours.
+
+That scale is lossless whenever the panel is a whole multiple of the render size:
+720p into a 1440p panel is exactly 2x, and nearest-neighbour at 2x invents
+nothing. At other ratios some pixel rows are duplicated and others are not, which
+is visible on text as slightly uneven strokes. `D3D9SW_SCALE=integer` trades that
+away, scaling by the largest whole multiple that fits and putting black bars
+around the rest. There is no third option that is both sharp and gap-free; the
+arithmetic does not allow one.
+
+The window can also be resized and maximized, which the game does not normally
+permit. Since the render size is fixed and only the final scale changes, a
+maximized window costs no more to draw than a small one.
 
 ## The one game bug this fixes
 
@@ -184,6 +226,10 @@ tell whether a change took effect.
 | `D3D9SW_THREADS=n` | Rasteriser worker threads. |
 | `D3D9SW_OVERRUN=0` | Disable the crash fix described above. |
 | `D3D9SW_PROF=1` | Per-frame timing to `d3d9_sw.log`. |
+| `D3D9SW_SCALE=integer` | Scale by whole multiples only, with black bars, instead of filling the window. |
+| `D3D9SW_DPI=0` | Do not claim DPI awareness, and let Windows scale the output instead. |
+| `D3D9SW_ALTENTER=0` | Disable the Alt+Enter fullscreen toggle. |
+| `D3D9SW_RESIZABLE=0` | Leave the game's window fixed-size as shipped, with no maximize button. |
 
 ## On the use of AI
 

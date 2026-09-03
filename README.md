@@ -46,7 +46,7 @@ that, install the **Microsoft Visual C++ 2010 Redistributable (x86)** from
 Microsoft.
 
 This project deliberately does not bundle those DLLs. They are Microsoft's
-files, not mine, and you should get them from Microsoft or from Steam rather
+copy written files, not mine, and you should get them from Microsoft or from Steam rather
 than from a stranger on the internet.
 
 ## What it actually is
@@ -111,7 +111,7 @@ disable it.
 ready to drop in. Build it only if you would rather not run a binary you did not
 compile — which is a perfectly reasonable thing to want.
 
-Requires [zig](https://ziglang.org/download/), used only as a C compiler because
+Requires [zig 0.15.2](https://ziglang.org/download/), used only as a C compiler because
 it cross-compiles to 32-bit Windows with no SDK install. There is nothing else
 to install — no Visual Studio, no Windows SDK.
 

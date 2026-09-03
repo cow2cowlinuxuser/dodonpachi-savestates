@@ -83,6 +83,12 @@ the rasteriser is multithreaded and uses SSE2/AVX2 where available.
   process. In practice this means an occasional restore that does nothing.
 - **Audio does not always follow a restore.** A track loaded at save time may
   not resume correctly. Gameplay is unaffected.
+- **Exclusive fullscreen is not implemented.** The wrapper never performs a
+  display mode switch, so a fullscreen request is ignored and the game keeps
+  presenting into a window. Run it windowed. Borderless would not need a mode
+  switch and is the obvious next step.
+- **The frame rate paces the game, not just the display.** On a CPU that cannot
+  hold 60, the game runs slower rather than dropping frames.
 - **Not a speedrun tool.** Frame timing is not cycle-accurate and this is not a
   substitute for real hardware or a verified emulator.
 

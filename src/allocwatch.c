@@ -264,6 +264,22 @@ static DWORD aw_env_num(const char *name, DWORD dflt)
 	return v;
 }
 
+/* Is the code at p the `rep movsd` this fix exists for? Probed rather than
+ * assumed, and probed defensively: an unrelated executable may not have
+ * anything mapped at that offset at all. */
+static int aw_is_rep_movsd(const void *p)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+			   PAGE_EXECUTE_WRITECOPY;
+	const unsigned char *b = (const unsigned char *)p;
+
+	if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+	    (mbi.Protect & exec) == 0)
+		return 0;
+	return b[0] == 0xF3 && b[1] == 0xA5;
+}
+
 /* Installed from the first Present rather than from DllMain: the fault happens
  * deep in a stage, and there is nothing to gain from holding the loader lock. */
 void allocwatch_frame(void)
@@ -280,6 +296,24 @@ void allocwatch_frame(void)
 	rva = aw_env_num("D3D9SW_OVERRUN_RVA", AW_SITE_RVA);
 	g_site = (char *)GetModuleHandleA(NULL) + rva;
 	g_want_dump = aw_env_num("D3D9SW_OVERRUN_DUMP", 0) != 0;
+
+	/* This address is one build of one executable's bug. Point the same DLL
+	 * at a different game - which people do, these engines are shared - and
+	 * the RVA lands on unrelated code that must not be touched.
+	 *
+	 * So confirm the instruction really is the copy we came for. F3 A5 is
+	 * rep movsd. Reading it from memory rather than the file also sidesteps
+	 * the Steam DRM, which only decrypts the section once it is running. If
+	 * it does not match, arm nothing: no handler, no risk. */
+	if (!aw_is_rep_movsd(g_site)) {
+		GetLocalTime(&st);
+		aw_raw("\r\n=== overrun guard %04d-%02d-%02d %02d:%02d:%02d pid %lu ===\r\n"
+		       "not arming: %08lX is not a rep movsd, so this is not the "
+		       "executable the fix was written for\r\n",
+		       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+		       GetCurrentProcessId(), (ULONG)(uintptr_t)g_site);
+		return;
+	}
 
 	if (!AddVectoredExceptionHandler(1, aw_veh))
 		return;

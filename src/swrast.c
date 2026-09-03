@@ -1976,6 +1976,13 @@ static void target_invalidate(const SwRast *r)
 void swrast_resize(SwRast *r, int width, int height)
 {
 	target_invalidate(r);
+	/* A device reset that does not change the size still arrives as a resize,
+	 * and this game issues a burst of them whenever its window is touched.
+	 * Reallocating several megabytes of colour and depth per frame to hand
+	 * back buffers of exactly the same shape is pure stutter. Reset only
+	 * promises the contents become undefined, which they may as well be. */
+	if (width == r->width && height == r->height && r->color && r->depth)
+		return;
 	free(r->color);
 	free(r->depth);
 	r->color = NULL;
@@ -2023,13 +2030,23 @@ void swrast_clear_depth(SwRast *r, float z)
 		r->depth[i] = z;
 }
 
+static int swrast_scale_integer(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = getenv("D3D9SW_SCALE");
+		cached = (v && (*v == 'i' || *v == 'I')) ? 1 : 0;
+	}
+	return cached;
+}
+
 void swrast_present(SwRast *r, HWND hwnd_override)
 {
 	BITMAPINFO bmi;
 	HDC hdc;
 	HWND hwnd = hwnd_override ? hwnd_override : r->hwnd;
 	RECT rc;
-	int dw, dh;
+	int dw, dh, dx, dy, cw, ch;
 
 	swrast_flush();
 	if (!r->color || !hwnd)
@@ -2044,17 +2061,78 @@ void swrast_present(SwRast *r, HWND hwnd_override)
 	bmi.bmiHeader.biCompression = BI_RGB;
 
 	GetClientRect(hwnd, &rc);
-	dw = rc.right - rc.left;
-	dh = rc.bottom - rc.top;
-	if (dw <= 0 || dh <= 0) {
-		dw = r->width;
-		dh = r->height;
+	cw = rc.right - rc.left;
+	ch = rc.bottom - rc.top;
+	if (cw <= 0 || ch <= 0) {
+		cw = r->width;
+		ch = r->height;
 	}
+
+	/* Fit inside the client area without distorting it. The window is now
+	 * whatever size the fullscreen switch or the user made it, and these
+	 * games are often 4:3 or rotated for TATE, so stretching to fill would
+	 * show the wrong shape. Scale to whichever axis binds first and centre
+	 * what is left. */
+	dw = cw;
+	dh = (int)(((long long)cw * r->height) / r->width);
+	if (dh > ch) {
+		dh = ch;
+		dw = (int)(((long long)ch * r->width) / r->height);
+	}
+
+	/* D3D9SW_SCALE=integer clamps to a whole multiple of the source.
+	 *
+	 * Filling the screen means a fractional scale - 1280 to 1707 is 1.3336 -
+	 * and nearest-neighbour at a fractional scale duplicates some pixel
+	 * columns and not others, so letter strokes come out visibly uneven.
+	 * That is arithmetic, not a defect, and the only ways out are to blur it
+	 * or to stop asking for a fractional scale. This is the second: take the
+	 * largest whole multiple that fits and put black around it. Sharp, but
+	 * it will not fill a screen that is not an exact multiple. */
+	if (swrast_scale_integer()) {
+		int k = cw / r->width;
+		int ky = ch / r->height;
+		if (ky < k)
+			k = ky;
+		if (k < 1)
+			k = 1;
+		dw = r->width * k;
+		dh = r->height * k;
+	}
+
+	dx = (cw - dw) / 2;
+	dy = (ch - dh) / 2;
 
 	hdc = GetDC(hwnd);
 	if (!hdc)
 		return;
-	StretchDIBits(hdc, 0, 0, dw, dh, 0, 0, r->width, r->height, r->color, &bmi,
+
+	/* The default stretch mode averages rows away when shrinking and is
+	 * nobody's idea of correct for a 2D game. COLORONCOLOR keeps pixels
+	 * whole, which is both what this art wants and the cheaper path. */
+	SetStretchBltMode(hdc, COLORONCOLOR);
+
+	/* Paint the letterbox bars. Only the bars, and only when there are any,
+	 * so the common windowed case where the frame fills the client area
+	 * costs nothing. */
+	if (dx > 0 || dy > 0) {
+		HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+		RECT b;
+		if (dy > 0) {
+			b.left = 0; b.right = cw; b.top = 0; b.bottom = dy;
+			FillRect(hdc, &b, black);
+			b.top = dy + dh; b.bottom = ch;
+			FillRect(hdc, &b, black);
+		}
+		if (dx > 0) {
+			b.top = dy; b.bottom = dy + dh; b.left = 0; b.right = dx;
+			FillRect(hdc, &b, black);
+			b.left = dx + dw; b.right = cw;
+			FillRect(hdc, &b, black);
+		}
+	}
+
+	StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, r->width, r->height, r->color, &bmi,
 		      DIB_RGB_COLORS, SRCCOPY);
 	ReleaseDC(hwnd, hdc);
 }

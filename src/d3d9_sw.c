@@ -136,6 +136,11 @@ static void backbuffer_size(HWND hwnd, int *w, int *h)
 	}
 	if (*w > 0 && *h > 0)
 		return;
+	/* A minimized window has a 0x0 client area, and taking the fallback
+	 * below would silently drop the game to 640x480 for the rest of the
+	 * run. Leave the size alone and let the caller's own fallback stand. */
+	if (hwnd && IsIconic(hwnd))
+		return;
 	if (hwnd && GetClientRect(hwnd, &rc) && rc.right > rc.left && rc.bottom > rc.top) {
 		*w = (int)(rc.right - rc.left);
 		*h = (int)(rc.bottom - rc.top);
@@ -156,6 +161,21 @@ typedef struct SwDevice {
 	SwD3D9 *parent;
 	HWND focus;
 	HWND device_window;
+	/* The size the game actually renders at, remembered so a resized or
+	 * borderless window cannot redefine it. */
+	int native_w, native_h;
+	/* The size the game built its layout around, taken once when the device
+	 * is created and never revised. See the comment in Dev_Reset. */
+	int layout_w, layout_h;
+	/* Borderless fullscreen state, and the window geometry to put back.
+	 * fs_user marks it as the user's choice via Alt+Enter, which outranks
+	 * whatever the game keeps asserting on reset. */
+	int fullscreen, fs_user;
+	/* Damping for the repair below: how long the window has been wrong, how
+	 * often we have already corrected it, and how long it has been right. */
+	int fs_drift, fs_repairs, fs_quiet, fs_gaveup;
+	LONG fs_style, fs_exstyle;
+	RECT fs_rect;
 	D3DPRESENT_PARAMETERS pp;
 	D3DVIEWPORT9 viewport;
 	D3DMATRIX world;
@@ -827,6 +847,8 @@ static UINT WINAPI Dev_GetNumberOfSwapChains(IDirect3DDevice9 *this)
 	return 1;
 }
 
+static void fullscreen_set(SwDevice *d, int on);
+
 static HRESULT WINAPI Dev_Reset(IDirect3DDevice9 *this, D3DPRESENT_PARAMETERS *pp)
 {
 	SwDevice *d = dev_from(this);
@@ -836,9 +858,63 @@ static HRESULT WINAPI Dev_Reset(IDirect3DDevice9 *this, D3DPRESENT_PARAMETERS *p
 	d->pp = *pp;
 	w = (int)pp->BackBufferWidth;
 	h = (int)pp->BackBufferHeight;
+	/* When the game leaves the size blank it means "same as before", not
+	 * "whatever the window is now". Adopting the client rect here is what
+	 * left the game drawing 1280x720 into the corner of a monitor-sized
+	 * buffer with the rest never written. Keep the render size and let
+	 * present scale it to whatever the window happens to be. */
+	if ((w <= 0 || h <= 0) && d->native_w > 0 && d->native_h > 0) {
+		w = d->native_w;
+		h = d->native_h;
+	}
+	/* Render at the size the game laid itself out for, whatever it asks for
+	 * now, and let present scale the result to the window.
+	 *
+	 * This game sizes its composite to the backbuffer exactly once, when the
+	 * device is created. A later reset changes the buffer but not the layout,
+	 * so the two disagree in whichever direction the size moved, and both
+	 * directions were visible while working this out: grow the buffer and the
+	 * game keeps drawing 1280x720 into the corner of it, leaving the rest
+	 * black; shrink it and the game keeps addressing the larger one and the
+	 * frame falls off the edge, cropped, with the art too big.
+	 *
+	 * Neither is a size to negotiate over, so stop negotiating. The layout
+	 * size is decided once and is the only size this device ever renders at.
+	 * Scaling it to the window afterwards is one StretchDIBits, which is the
+	 * display driver's blitter rather than this CPU, and on a panel that is a
+	 * whole multiple of the layout - 1280x720 into 2560x1440 - that scale is
+	 * exactly 2x, where nearest-neighbour loses nothing at all. */
+	if (d->layout_w > 0 && d->layout_h > 0 && (w != d->layout_w || h != d->layout_h)) {
+		char msg[128];
+		_snprintf(msg, sizeof(msg),
+			  "reset: game asked for %dx%d, rendering at its layout size %dx%d and "
+			  "scaling to the window",
+			  w, h, d->layout_w, d->layout_h);
+		sw_log(msg);
+		w = d->layout_w;
+		h = d->layout_h;
+	}
 	backbuffer_size(pp->hDeviceWindow ? pp->hDeviceWindow : d->device_window, &w, &h);
 	d->pp.BackBufferWidth = (UINT)w;
 	d->pp.BackBufferHeight = (UINT)h;
+	/* Remember the size only from a reset that can be trusted to carry one.
+	 * This is now just the fallback for a reset that leaves the size blank,
+	 * but a reset taken while minimized reports a 0x0 client area, and
+	 * recording that would make the fallback itself the thing that breaks. */
+	if (!IsIconic(d->device_window) && w > 0 && h > 0) {
+		d->native_w = w;
+		d->native_h = h;
+	}
+	/* After the size is settled, never before: going borderless changes the
+	 * client rect, and backbuffer_size falls back to reading it.
+	 *
+	 * Skipped once the user has taken control with Alt+Enter. The game still
+	 * believes it is windowed and says so on every reset, so obeying that
+	 * would drop straight back out of the fullscreen the user just asked
+	 * for - and since our own resize is what provokes the reset, it would do
+	 * it immediately, every time. */
+	if (!d->fs_user)
+		fullscreen_set(d, !pp->Windowed);
 	swrast_resize(&d->rast, w, h);
 	d->viewport.X = 0;
 	d->viewport.Y = 0;
@@ -1073,6 +1149,326 @@ static void prof_frame(void)
 		fflush(f);
 }
 
+/* Borderless, not a real display mode switch.
+ *
+ * Exclusive fullscreen exists so a GPU can own the scanout and flip pages. This
+ * renderer is software and presents through GDI, so there is nothing to own and
+ * nothing to gain - and a mode switch is precisely the part of D3D9 fullscreen
+ * that leaves people staring at a 640x480 desktop when a game dies holding it.
+ *
+ * So cover the monitor the window is already on, strip the frame, and let
+ * swrast_present letterbox the backbuffer into it. The game keeps rendering at
+ * whatever size it asked for. */
+static int env_flag(const char *name, int dflt);
+
+/* Tell Windows we mean real pixels.
+ *
+ * On a display scaled past 100% - 150% is the common laptop and 1440p default -
+ * a process that has not said this is lied to for its own good: the desktop
+ * reports 1707x960 when the panel is 2560x1440, the window is created in those
+ * fictional units, and the compositor stretches whatever it draws up to the
+ * real panel with a bilinear filter nobody asked for.
+ *
+ * For a 3D game that is merely soft. For this one it is worse, because it
+ * stacks: we scale 1280x720 to the fake 1707x960 with a fractional factor that
+ * duplicates pixel columns unevenly, and Windows then blurs the result on the
+ * way to the panel. Two resamples, and the second is not ours to control.
+ *
+ * Claiming awareness collapses both into one. The window gets the panel's real
+ * pixels, and the single remaining scale is ours - which on this machine is
+ * 1280x720 into 2560x1440, exactly 2x, where nearest-neighbour is lossless.
+ *
+ * Resolved through GetProcAddress because these arrived across three Windows
+ * releases and the oldest target here predates all of them; the per-monitor
+ * paths simply will not be found on 7, which is fine, the last fallback has
+ * existed since Vista. D3D9SW_DPI=0 opts out. */
+static BOOL CALLBACK dpi_count_windows(HWND hwnd, LPARAM lp)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == GetCurrentProcessId())
+		++*(int *)lp;
+	return TRUE;
+}
+
+static void dpi_awareness_once(void)
+{
+	static volatile LONG once;
+	HMODULE u32;
+	FARPROC p;
+	int existing = 0;
+
+	if (InterlockedExchange(&once, 1))
+		return;
+	if (!env_flag("D3D9SW_DPI", 1)) {
+		sw_log("dpi: disabled by D3D9SW_DPI=0; a scaled display will resample the output");
+		return;
+	}
+
+	/* Awareness is meant to be declared before the process owns a window -
+	 * by manifest, ideally. A wrapper has no manifest and no DllMain here, so
+	 * the earliest reachable moment is this one, and for a D3D9 title that is
+	 * normally still before any window exists. Normally is not always, and
+	 * changing awareness underneath a live window is the one thing here that
+	 * genuinely reaches into the compositor. So count them and say so: if
+	 * this ever prints a non-zero, the sizing oddity that follows has a named
+	 * suspect instead of being blamed on a graphics driver. */
+	EnumWindows(dpi_count_windows, (LPARAM)&existing);
+	if (existing) {
+		char msg[128];
+		_snprintf(msg, sizeof(msg),
+			  "dpi: %d window(s) already exist; claiming awareness now is "
+			  "mixed-mode (D3D9SW_DPI=0 to skip)",
+			  existing);
+		sw_log(msg);
+	}
+
+	u32 = GetModuleHandleA("user32.dll");
+	if (u32) {
+		/* Windows 10 1703+. -4 is PER_MONITOR_AWARE_V2. */
+		p = GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+		if (p && ((BOOL(WINAPI *)(HANDLE))p)((HANDLE)-4)) {
+			sw_log("dpi: per-monitor v2, rendering at real pixels");
+			return;
+		}
+	}
+	{
+		/* Windows 8.1. 2 is PROCESS_PER_MONITOR_DPI_AWARE. */
+		HMODULE sh = LoadLibraryA("shcore.dll");
+		if (sh) {
+			p = GetProcAddress(sh, "SetProcessDpiAwareness");
+			if (p && ((HRESULT(WINAPI *)(int))p)(2) == S_OK) {
+				sw_log("dpi: per-monitor, rendering at real pixels");
+				return;
+			}
+			FreeLibrary(sh);
+		}
+	}
+	if (u32) {
+		p = GetProcAddress(u32, "SetProcessDPIAware");
+		if (p && ((BOOL(WINAPI *)(void))p)()) {
+			sw_log("dpi: system-aware, rendering at real pixels");
+			return;
+		}
+	}
+	sw_log("dpi: could not claim awareness; a scaled display will resample the output");
+}
+
+/* A window rect worth restoring to. A minimized window reports (-32000,-32000)
+ * and a window mid-teardown can report an empty box; restoring either produces
+ * the collapsed sliver of a title bar with no client area under it. */
+static int fs_rect_usable(const RECT *r)
+{
+	return r->right - r->left >= 64 && r->bottom - r->top >= 64 && r->left > -30000 &&
+	       r->top > -30000;
+}
+
+/* Is this rect already the fullscreen shape? Such a rect is never the windowed
+ * geometry to return to, whatever the flags currently say. Toggling repeatedly
+ * used to let one of these be recorded as the windowed rect, after which
+ * leaving fullscreen "restored" the window to fullscreen and the two states
+ * became indistinguishable - the toggle degrading a little on every press. */
+static int fs_rect_covers_monitor(HWND hwnd, const RECT *r)
+{
+	MONITORINFO mi;
+	HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+
+	mi.cbSize = sizeof(mi);
+	if (!mon || !GetMonitorInfoA(mon, &mi))
+		return 0;
+	return r->right - r->left >= mi.rcMonitor.right - mi.rcMonitor.left &&
+	       r->bottom - r->top >= mi.rcMonitor.bottom - mi.rcMonitor.top;
+}
+
+/* Stretch the window over the monitor it is on. Split out from fullscreen_set
+ * because it has to be re-runnable: this is also the repair path. */
+static int fs_cover_monitor(SwDevice *d, HWND hwnd)
+{
+	MONITORINFO mi;
+	HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+
+	mi.cbSize = sizeof(mi);
+	if (!mon || !GetMonitorInfoA(mon, &mi))
+		return 0;
+	SetWindowLongA(hwnd, GWL_STYLE,
+		       (GetWindowLongA(hwnd, GWL_STYLE) &
+			~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX |
+			  WS_SYSMENU)) |
+			       WS_POPUP);
+	SetWindowLongA(hwnd, GWL_EXSTYLE,
+		       GetWindowLongA(hwnd, GWL_EXSTYLE) &
+			       ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE |
+				 WS_EX_STATICEDGE));
+	/* Deliberately not topmost. Topmost hides crash dialogs behind the
+	 * game and makes alt-tab a fight, and it buys nothing when no
+	 * exclusive mode is being held. */
+	SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
+		     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+		     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+	return 1;
+}
+
+static void fullscreen_set(SwDevice *d, int on)
+{
+	HWND hwnd;
+
+	if (!d)
+		return;
+	hwnd = d->device_window;
+	if (!hwnd || !IsWindow(hwnd) || !on == !d->fullscreen)
+		return;
+
+	if (on) {
+		LONG style = GetWindowLongA(hwnd, GWL_STYLE);
+		RECT rc;
+
+		/* Snapshot what to come back to - but only if the window is in a
+		 * state worth coming back to. Going fullscreen from a minimized
+		 * window would otherwise record the minimized rect as the
+		 * windowed one, and leaving fullscreen later would "restore" the
+		 * window to a sliver. */
+		GetWindowRect(hwnd, &rc);
+		if (!IsIconic(hwnd) && fs_rect_usable(&rc) && !fs_rect_covers_monitor(hwnd, &rc) &&
+		    (style & WS_POPUP) == 0) {
+			d->fs_style = style;
+			d->fs_exstyle = GetWindowLongA(hwnd, GWL_EXSTYLE);
+			d->fs_rect = rc;
+		} else if (!fs_rect_usable(&d->fs_rect)) {
+			/* Nothing good recorded and nothing good to record.
+			 * Synthesise a windowed rect from the render size so
+			 * the exit path always has somewhere sane to land. */
+			d->fs_style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+			d->fs_exstyle = 0;
+			d->fs_rect.left = 64;
+			d->fs_rect.top = 64;
+			d->fs_rect.right = 64 + (d->native_w > 0 ? d->native_w : D3D9_SW_FB_W);
+			d->fs_rect.bottom = 64 + (d->native_h > 0 ? d->native_h : D3D9_SW_FB_H);
+		}
+
+		if (!fs_cover_monitor(d, hwnd))
+			return;
+		d->fullscreen = 1;
+		sw_log("fullscreen: on (borderless, no mode switch)");
+	} else {
+		if (!fs_rect_usable(&d->fs_rect)) {
+			d->fs_rect.left = 64;
+			d->fs_rect.top = 64;
+			d->fs_rect.right = 64 + (d->native_w > 0 ? d->native_w : D3D9_SW_FB_W);
+			d->fs_rect.bottom = 64 + (d->native_h > 0 ? d->native_h : D3D9_SW_FB_H);
+		}
+		if (!(d->fs_style & (WS_CAPTION | WS_POPUP)))
+			d->fs_style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+		SetWindowLongA(hwnd, GWL_STYLE, d->fs_style);
+		SetWindowLongA(hwnd, GWL_EXSTYLE, d->fs_exstyle);
+		SetWindowPos(hwnd, NULL, d->fs_rect.left, d->fs_rect.top,
+			     d->fs_rect.right - d->fs_rect.left, d->fs_rect.bottom - d->fs_rect.top,
+			     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		d->fullscreen = 0;
+		sw_log("fullscreen: off");
+	}
+}
+
+/* Fullscreen here is a shape we impose on someone else's window, and plenty of
+ * things reshape it back: minimizing on alt-tab, the game resizing itself on
+ * focus loss, the restore that follows. Setting it once and assuming it sticks
+ * is what left the window collapsed to a title bar after an alt-tab.
+ *
+ * So re-check it every frame instead of trusting an event. It is two cheap
+ * queries against values already in the window manager's hands, and it repairs
+ * any disturbance regardless of what caused it - including ones not yet found.
+ * A minimized window is left alone: that is the user's own doing, and forcing
+ * it back open would make the taskbar button useless. */
+static void fullscreen_reassert(SwDevice *d)
+{
+	HWND hwnd;
+	RECT rc;
+	MONITORINFO mi;
+	HMONITOR mon;
+
+	if (!d || !d->fullscreen)
+		return;
+	hwnd = d->device_window;
+	if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd))
+		return;
+
+	mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	mi.cbSize = sizeof(mi);
+	if (!mon || !GetMonitorInfoA(mon, &mi) || !GetWindowRect(hwnd, &rc))
+		return;
+	if (rc.left == mi.rcMonitor.left && rc.top == mi.rcMonitor.top &&
+	    rc.right == mi.rcMonitor.right && rc.bottom == mi.rcMonitor.bottom &&
+	    (GetWindowLongA(hwnd, GWL_STYLE) & WS_CAPTION) == 0) {
+		/* Right for long enough to call it settled. Forgive the earlier
+		 * corrections so a later, unrelated disturbance still gets its
+		 * full budget rather than inheriting an exhausted one. */
+		d->fs_drift = 0;
+		if (++d->fs_quiet > 120) {
+			d->fs_quiet = 0;
+			d->fs_repairs = 0;
+			d->fs_gaveup = 0;
+		}
+		return;
+	}
+
+	d->fs_quiet = 0;
+	if (d->fs_gaveup)
+		return;
+
+	/* Resizing the window makes the game reset its device, and this game
+	 * answers a reset by restyling its window - which reads as drift, which
+	 * would resize it again. Correcting on sight turned two keypresses into
+	 * eight corrections and eleven resets, and a device reset per frame is
+	 * the stutter rather than any one wrong window.
+	 *
+	 * So let it be wrong briefly. Most drift is the game's own reset
+	 * sequence still in progress and settles by itself within a frame or
+	 * two; only what survives that is worth correcting. */
+	if (++d->fs_drift < 4)
+		return;
+	d->fs_drift = 0;
+
+	/* And if correcting it never takes, stop. A window of the wrong shape is
+	 * a cosmetic complaint; a fight with the game over it every frame is not,
+	 * and it is the game that has to keep running. */
+	if (++d->fs_repairs > 6) {
+		d->fs_gaveup = 1;
+		sw_log("fullscreen: the game keeps reshaping its window; leaving it alone "
+		       "(Alt+Enter to try again)");
+		return;
+	}
+
+	sw_log("fullscreen: window drifted, restoring borderless geometry");
+	fs_cover_monitor(d, hwnd);
+}
+
+static int env_flag(const char *name, int dflt);
+
+/* GetAsyncKeyState reports the physical keyboard, not this window's input, so
+ * every hotkey here fires just as happily while the player is alt-tabbed into a
+ * browser. Gate the lot on actually being the foreground window: Alt+Enter in
+ * another app must not flip the game's display mode, and Alt is held down for
+ * the entire duration of an Alt+Tab. */
+static int dev_has_focus(const SwDevice *d)
+{
+	HWND fg = GetForegroundWindow();
+	if (!fg)
+		return 0;
+	if (d->device_window && fg == d->device_window)
+		return 1;
+	if (d->focus && fg == d->focus)
+		return 1;
+	/* Some games present into a child of the window that holds focus. */
+	return d->device_window && IsChild(fg, d->device_window);
+}
+
+static int alt_enter_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0)
+		cached = env_flag("D3D9SW_ALTENTER", 1);
+	return cached;
+}
+
 static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const RECT *dst,
 				  HWND hwnd_override, const RGNDATA *dirty)
 {
@@ -1086,11 +1482,25 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 	prof_frame();
 	allocwatch_frame();
 	savestate_guard();
+	/* Alt+Enter, the convention every game of this era shipped with. Polled
+	 * here rather than by subclassing the window, for the same reason the
+	 * rewind keys are: nothing to install and nothing left behind to unhook
+	 * if the process dies badly. D3D9SW_ALTENTER=0 if a game handles it
+	 * itself and the two fight. */
+	if (dev_has_focus(d) && alt_enter_enabled() && (GetAsyncKeyState(VK_MENU) & 0x8000) &&
+	    (GetAsyncKeyState(VK_RETURN) & 1)) {
+		fullscreen_set(d, !d->fullscreen);
+		d->fs_user = d->fullscreen;
+		/* An explicit request earns a clean slate, including after we
+		 * previously gave up trying to hold the shape. */
+		d->fs_drift = d->fs_repairs = d->fs_quiet = d->fs_gaveup = 0;
+	}
+	fullscreen_reassert(d);
 	/* Rewind hotkeys. Taken after the flush, so no draw is in flight and the
 	 * snapshot sees a quiescent renderer: F5..F8 save, shift+F5..F8 restore. */
 	{
 		int k;
-		for (k = 0; k < SAVESTATE_SLOTS; k++) {
+		for (k = 0; dev_has_focus(d) && k < SAVESTATE_SLOTS; k++) {
 			if (!(GetAsyncKeyState(VK_F5 + k) & 1))
 				continue;
 			if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
@@ -1119,7 +1529,7 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 	 * frame. Recording is off at every other moment. */
 	{
 		static int pending;
-		if (GetAsyncKeyState(VK_F9) & 1) {
+		if (dev_has_focus(d) && (GetAsyncKeyState(VK_F9) & 1)) {
 			swrast_drawid_arm();
 			if (!g_draw_log) {
 				g_draw_log = fopen("d3d9_sw_draws.txt", "w");
@@ -6038,6 +6448,46 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *this, UINT adapter, D3DDEVTYP
 	dev->viewport.Width = (DWORD)w;
 	dev->viewport.Height = (DWORD)h;
 	dev->viewport.MaxZ = 1.0f;
+	dev->native_w = w;
+	dev->native_h = h;
+	/* Taken here and nowhere else. This is the moment the game measures the
+	 * device to build its layout against, so this is the size it will go on
+	 * drawing at no matter what any later reset claims. Captured before the
+	 * fullscreen switch below, which resizes the window and would otherwise
+	 * overwrite the very thing being recorded. */
+	dev->layout_w = w;
+	dev->layout_h = h;
+	{
+		char msg[96];
+		_snprintf(msg, sizeof(msg), "layout: %dx%d (render size for this device)", w, h);
+		sw_log(msg);
+	}
+	/* Let the window be maximized and dragged to a size.
+	 *
+	 * The game ships a fixed-size window because a real D3D9 device would
+	 * have to be reset to follow one, and it would rather not. Nothing here
+	 * cares: the render size is pinned to the layout above and present scales
+	 * it to whatever the client area happens to be, so a maximized window is
+	 * the same work as a small one and needs no cooperation from the game.
+	 *
+	 * Only the frame bits, and only while windowed - this is not fullscreen
+	 * and deliberately keeps the title bar, the taskbar and the other
+	 * monitor. D3D9SW_RESIZABLE=0 to leave the window exactly as shipped. */
+	if (pp->Windowed && env_flag("D3D9SW_RESIZABLE", 1) && hwnd && IsWindow(hwnd)) {
+		LONG s = GetWindowLongA(hwnd, GWL_STYLE);
+		if ((s & (WS_THICKFRAME | WS_MAXIMIZEBOX)) != (WS_THICKFRAME | WS_MAXIMIZEBOX)) {
+			SetWindowLongA(hwnd, GWL_STYLE, s | WS_THICKFRAME | WS_MAXIMIZEBOX);
+			SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+				     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+					     SWP_FRAMECHANGED);
+			sw_log("window: maximize and resize enabled");
+		}
+	}
+	/* The game asked for fullscreen through its own config, so honour it
+	 * without parsing anyone's ini: every D3D9 title of this era expresses
+	 * that request here, as Windowed == FALSE. */
+	if (!pp->Windowed)
+		fullscreen_set(dev, 1);
 	dev->scissor.right = w;
 	dev->scissor.bottom = h;
 	if (!swrast_init(&dev->rast, hwnd, w, h)) {
@@ -6161,6 +6611,9 @@ IDirect3D9 *WINAPI Direct3DCreate9(UINT sdk)
 		d3d9_trace_wrap_d3d((void **)&kD3DVtbl, sizeof(kD3DVtbl));
 	sw_trace("Direct3DCreate9 sdk=%u", sdk);
 	log_env_once();
+	/* Before the game creates its window, so it is sized in real pixels
+	 * from the start rather than being reinterpreted underneath us. */
+	dpi_awareness_once();
 	d = (SwD3D9 *)calloc(1, sizeof(*d));
 	if (!d)
 		return NULL;

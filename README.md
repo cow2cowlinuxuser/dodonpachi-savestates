@@ -3,7 +3,7 @@
 Save states for **DoDonPachi Resurrection** on PC, via a drop-in replacement for
 `d3d9.dll` that renders the entire game on the CPU.
 
-Four slots, saved and restored instantly from the keyboard, so you can drill a
+One slot, saved and restored instantly from the keyboard, so you can drill a
 boss pattern from the exact moment before it kills you instead of replaying the
 stage. There is no emulator involved — the retail Steam build runs normally, and
 the wrapper sits between it and Direct3D.
@@ -14,9 +14,15 @@ the wrapper sits between it and Direct3D.
 
 | Key | Action |
 | --- | --- |
-| `F5` `F6` `F7` `F8` | Save state to slot 1–4 |
-| `Shift` + `F5`…`F8` | Restore that slot |
+| `F5` | Save state |
+| `Shift` + `F5` | Restore it |
 | `F9` | Lossless screen capture, for reporting rendering bugs |
+
+There is currently **one** slot. The hotkey handler is written for `F5`
+onwards and will light up `F6`–`F8` the moment `SAVESTATE_SLOTS` in
+`src/savestate.h` is raised, but a snapshot holds a copy of the game's writable
+memory and the game is not small, so extra slots cost real RAM. It is set to
+one until somebody has measured what four actually costs.
 
 ## Install
 
@@ -101,15 +107,27 @@ disable it.
 
 ## Building
 
+**You do not need to build this.** The [release](../../releases) has the DLL
+ready to drop in. Build it only if you would rather not run a binary you did not
+compile — which is a perfectly reasonable thing to want.
+
 Requires [zig](https://ziglang.org/download/), used only as a C compiler because
 it cross-compiles to 32-bit Windows with no SDK install. Any clang that can
-target `i386-windows-gnu` would do.
+target `i386-windows-gnu` would do. There is nothing else to install.
 
-```powershell
-.\build.ps1
+Then double-click **`build.cmd`**, or from a terminal:
+
+```
+build.cmd
 ```
 
 `build\d3d9.dll` is the file to drop next to the game.
+
+`build.cmd` exists because PowerShell refuses to run unsigned scripts that came
+from the internet, and `build.ps1` will have. It scopes that exemption to this
+one script rather than asking you to weaken a machine-wide setting. If you would
+rather invoke the script directly, `powershell -ExecutionPolicy Bypass -File
+build.ps1` does the same thing, and reading both files first is encouraged.
 
 ## Verifying it
 

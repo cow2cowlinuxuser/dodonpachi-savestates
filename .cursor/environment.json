@@ -1,0 +1,4 @@
+{
+  "name": "dodonpachi-savestates",
+  "install": "bash .cursor/setup.sh"
+}

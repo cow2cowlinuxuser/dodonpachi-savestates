@@ -33,14 +33,30 @@ echo "built build/d3d9.dll (PE32 - this is the file you drop next to the game)"
   -o build/test_seam.exe tests/test_seam.c src/swrast.c -luser32 -lgdi32
 
 # The savestate harness drives savestate.c directly, no wrapper and no game.
+# build.ps1 builds it 64-bit for parity with a Windows host; kept here too so
+# the same artifact is produced.
 "$ZIG" cc "${WARN[@]}" -Isrc -target x86_64-windows-gnu \
   -o build/ss_harness.exe tests/ss_harness.c src/savestate.c -luser32
+
+# 32-bit variant of the same harness. The savestate engine ships inside the
+# 32-bit d3d9.dll, so this matches its real target. Under Wine on Linux this is
+# the build to run: the 64-bit build reliably stalls in Wine's thread-suspend/
+# context path, while this one exercises the real save/restore machinery
+# (correct on most runs: 0 bad, sub-ms restores). Note Wine only approximates
+# the engine's manual thread-suspend + stack/context rewind, so an occasional
+# run still aborts under Wine (hang, glibc stack-canary, or a wild read); long
+# runs also hit the 32-bit 2 GB address ceiling and fail closed by design. The
+# engine's authoritative verification is on real Windows; keep runs bounded
+# (e.g. 30-50 cycles) for a Linux smoke test.
+"$ZIG" cc "${WARN[@]}" -Isrc -target x86-windows-gnu \
+  -o build/ss_harness32.exe tests/ss_harness.c src/savestate.c -luser32
 
 # A tiny D3D9 program that loads the wrapper and draws, so the DLL can be shown
 # to work without launching the game. 32-bit, to match it.
 "$ZIG" cc "${WARN[@]}" -Isrc -target x86-windows-gnu \
   -o build/d3d9_sw_test.exe tests/test.c -luser32 -lgdi32
 
-echo "built build/test_seam.exe build/ss_harness.exe build/d3d9_sw_test.exe"
+echo "built build/test_seam.exe build/ss_harness.exe build/ss_harness32.exe build/d3d9_sw_test.exe"
 echo ""
 echo "run ./build/test_seam.exe to verify the rasteriser (under Wine on non-Windows)"
+echo "run ./build/ss_harness32.exe to verify the savestate engine (32-bit; runs under Wine)"

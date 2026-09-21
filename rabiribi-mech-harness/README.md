@@ -128,9 +128,18 @@ exact framebuffer it produced. `save` renders and writes both to disk and exits;
 device, re-renders, and compares hash + pixel-for-pixel.
 
 ```bash
-wine build/d3d11_xsession.exe save    snap.bin 12345
-wine build/d3d11_xsession.exe restore snap.bin out.ppm   # a separate process
+wine build/d3d11_xsession32.exe save snap.bin 4242
+wine build/d3d11_xsession32.exe prove snap.bin
+wine build/d3d11_xsession32.exe restore snap.bin out.ppm
 ```
+
+Uses `d3d11_scene` (**512×512**, many quads/triangles, 16 ballast textures). Snapshot
+`D3D11XS2` saves logical state + six COM/resource pointer values + frame bytes;
+`prove` checks 6/6 saved pointers are not restore targets; `restore` recreates and
+matches **0/N** pixel diffs. See Project store sitting
+`docs/mech-harness/cross-session-com-gpu-heavy-sitting.md`.
+
+Legacy single-triangle `D3D11XS1` snapshots are obsolete.
 
 Measured (each line a distinct PID / fresh device, CPU backend):
 

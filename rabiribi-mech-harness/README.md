@@ -81,12 +81,44 @@ WINEPREFIX=$HOME/.wine-ddp DISPLAY=:1 wine build/d3d11_probe.exe out.ppm   # or 
 
 Measured here: device created at **feature level 11.0** on the CPU backend, both
 PE32 and 64-bit; the triangle renders (corner = magenta clear, interior =
-Gouraud blend). That establishes the substrate. The next step is to place the
-D3D11 device's own writable state (and the wined3d/driver objects that straddle
-the boundary) into the capture/verify/restore loop and find where the GPU side
-sits in the same Class A/B/C map - in particular which device state is present
-(outside the snapshot) versus rewound, and whether a verify-or-refuse capture
-holds when a GPU/driver object is live.
+Gouraud blend). That establishes the substrate.
+
+### `d3d11_state_harness.c` - save/restore of D3D11 device state
+
+Builds on the probe to answer the two questions that matter for a savestate,
+without pretending to rewind true driver/GPU memory:
+
+- **Does the device keep existing across save/restore?** One persistent
+  `ID3D11Device` and its resources are reused for every cycle and polled for
+  removal.
+- **Can we observe mutations, and validate none after a restore?** Two views of
+  state are compared each cycle: the *logical* state (a GPU-resident constant
+  buffer, read back FROM the device) and the *visible* state (the rendered
+  framebuffer, fingerprinted). "Restore" writes the saved bytes back into the
+  GPU resource and re-renders.
+
+```bash
+WINEPREFIX=$HOME/.wine-ddp DISPLAY=:1 wine build/d3d11_state_harness.exe 300
+```
+
+Measured (300 cycles/mode, CPU backend):
+
+| mode | result |
+| --- | --- |
+| NOOP | visible_equal 300/300, cb_equal 300/300 (no visible mutation) |
+| MUTATE+RESTORE | mutation_observed 300/300, then visible_equal 300/300, cb_equal 300/300 |
+| MUTATE-only (control) | mutation_observed 300/300, visible_equal 0/300 |
+
+Device stayed alive the whole run (0 removal events, ~2100 draws). So the device
+persists, a mutation is observable in both the logical constant buffer and the
+rendered frame, and a content-level restore leaves **no visible mutation** - with
+the control confirming the comparison actually bites.
+
+The next step is to place the wined3d/driver objects that straddle the snapshot
+boundary into the capture/verify/restore loop and find where the GPU side sits
+in the same Class A/B/C map - which device state is present (outside the
+snapshot) versus rewound, and whether a verify-or-refuse capture holds when a
+GPU/driver object is live.
 
 ## Scope
 

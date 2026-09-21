@@ -22,3 +22,8 @@ echo "built build/rr_mech_harness32.exe (PE32, the one to run) and build/rr_mech
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/d3d11_probe.exe   d3d11_probe.c -ld3d11 -ldxgi
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/d3d11_probe32.exe d3d11_probe.c -ld3d11 -ldxgi
 echo "built build/d3d11_probe.exe and build/d3d11_probe32.exe"
+
+# D3D11 device-state save/restore harness (observe mutations, validate restore).
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/d3d11_state_harness.exe   d3d11_state_harness.c -ld3d11 -ldxgi
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/d3d11_state_harness32.exe d3d11_state_harness.c -ld3d11 -ldxgi
+echo "built build/d3d11_state_harness.exe and build/d3d11_state_harness32.exe"

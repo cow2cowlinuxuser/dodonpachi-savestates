@@ -149,11 +149,48 @@ savestate needs. It matches the "same-boot cross-session restore" the source
 repo's `determinism.md` flagged as testable-but-untested; here it is tested, for
 the D3D11 device-state slice, and it holds.
 
-The remaining step is to place the wined3d/driver objects that straddle the
-snapshot boundary into the capture/verify/restore loop and find where the GPU
-side sits in the same Class A/B/C map - which device state is present (outside
-the snapshot) versus rewound, and whether a verify-or-refuse capture holds when a
-GPU/driver object is live.
+### `d3d11_coexist.c` - the savestate loop WITH a live wined3d device
+
+The gating question: does Wine block us? A real D3D11 device spins up wined3d's
+own threads and driver objects. This harness stands one up and runs the arena
+capture/verify/restore loop (our worker threads churning a rewound arena,
+quiesced at a cooperative safe point) interleaved with rendering, holding the
+live device pointer INSIDE the rewound arena.
+
+```bash
+wine build/d3d11_coexist.exe 300            # Class B: device held through the rewind
+wine build/d3d11_coexist.exe 120 --retire   # Class A: device recreated each cycle
+```
+
+Measured (CPU backend, wined3d live throughout):
+
+| mode | result |
+| --- | --- |
+| Class B (device pointer carried through the rewind), 300 cycles | poisoned 0, render_mismatch 0, Class B pointer valid 300/300, device removals 0, **PASS** |
+| Class A (`--retire`, device recreated between save and restore), 120 cycles | straddle detected 120/120, re-pinned 120/120, render_mismatch 0, poisoned 0, **PASS** |
+
+What this establishes:
+
+- **Wine does not block us.** The whole loop runs to completion with wined3d
+  live - even recreating the device every cycle 120 times - with no deadlock.
+  The reason: we quiesce OUR workers at a cooperative safe point and never
+  `SuspendThread` wined3d's threads, side-stepping the suspend-all-then-wait-on-
+  wineserver hazard the source repo's notes warn about.
+- **Class B holds with a real object.** The live device pointer, carried through
+  a memcpy-rewind of the arena, is still valid every time and still renders the
+  restored frame.
+- **Class A is handled safely.** When the present side "moves on" (device
+  released and recreated), the arena's rewound handle carries a stale generation;
+  we DETECT that via a generational handle instead of calling through a dangling
+  COM pointer, and re-pin to the current device (object retirement). The frame
+  still reproduces after re-pin, because the render is deterministic across
+  device instances (same property proven in `d3d11_xsession`).
+
+So a real wined3d/D3D11 object can live inside the capture/restore loop, sit in
+the Class A/B map exactly where the docs predicted, and be handled - and Wine is
+not the blocker. The next step is depth: bring the wined3d object *graph*
+(views, buffers, shaders, driver-side allocations) under the same handle/verify
+discipline rather than a single device pointer.
 
 ## Scope
 

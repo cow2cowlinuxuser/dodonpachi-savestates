@@ -33,3 +33,9 @@ echo "built build/d3d11_state_harness.exe and build/d3d11_state_harness32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/d3d11_xsession.exe   d3d11_xsession.c -ld3d11 -ldxgi
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/d3d11_xsession32.exe d3d11_xsession.c -ld3d11 -ldxgi
 echo "built build/d3d11_xsession.exe and build/d3d11_xsession32.exe"
+
+# D3D11 coexistence: run the savestate capture/restore loop WITH a live wined3d
+# device in the process (Class B held pointer; --retire for Class A straddle).
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/d3d11_coexist.exe   d3d11_coexist.c -ld3d11 -ldxgi
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/d3d11_coexist32.exe d3d11_coexist.c -ld3d11 -ldxgi
+echo "built build/d3d11_coexist.exe and build/d3d11_coexist32.exe"

@@ -114,10 +114,45 @@ persists, a mutation is observable in both the logical constant buffer and the
 rendered frame, and a content-level restore leaves **no visible mutation** - with
 the control confirming the comparison actually bites.
 
-The next step is to place the wined3d/driver objects that straddle the snapshot
-boundary into the capture/verify/restore loop and find where the GPU side sits
-in the same Class A/B/C map - which device state is present (outside the
-snapshot) versus rewound, and whether a verify-or-refuse capture holds when a
+### `d3d11_xsession.c` - close the program, reopen it, reproduce the snapshot
+
+The real prize: can a snapshot taken in one session be reproduced after the
+process exits? Each run is a **separate process** with a brand-new
+`ID3D11Device` (and, under Wine, a fresh wined3d instance), so a match proves we
+coexist with wined3d well enough that the 3D state is reproducible across
+sessions.
+
+A snapshot holds the GPU-resident logical state (the constant buffer) plus the
+exact framebuffer it produced. `save` renders and writes both to disk and exits;
+`restore` starts fresh, loads the snapshot, writes the logical state into a NEW
+device, re-renders, and compares hash + pixel-for-pixel.
+
+```bash
+wine build/d3d11_xsession.exe save    snap.bin 12345
+wine build/d3d11_xsession.exe restore snap.bin out.ppm   # a separate process
+```
+
+Measured (each line a distinct PID / fresh device, CPU backend):
+
+| session | result |
+| --- | --- |
+| A save (seed 12345) | fp=0xffeb184e written to disk |
+| B restore (fresh process) | reproduced fp=0xffeb184e, **pixel_diffs 0/65536**, PASS |
+| C restore (fresh process) | reproduced fp=0xffeb184e, **pixel_diffs 0/65536**, PASS |
+| seed 777, save+restore | reproduced fp=0x81380854, **0/65536**, PASS |
+| negative control (1 byte of stored frame flipped) | pixel_diffs 1/65536, FAIL (comparison bites) |
+
+So a fresh process reproduces a previously taken snapshot **bit-for-bit**. This
+works because the draw is deterministic (opaque triangle, no blending) and the
+logical state fully determines the frame - the two properties a cross-session
+savestate needs. It matches the "same-boot cross-session restore" the source
+repo's `determinism.md` flagged as testable-but-untested; here it is tested, for
+the D3D11 device-state slice, and it holds.
+
+The remaining step is to place the wined3d/driver objects that straddle the
+snapshot boundary into the capture/verify/restore loop and find where the GPU
+side sits in the same Class A/B/C map - which device state is present (outside
+the snapshot) versus rewound, and whether a verify-or-refuse capture holds when a
 GPU/driver object is live.
 
 ## Scope

@@ -134,14 +134,8 @@ static int create_ballast(D3d11Scene *sc, unsigned seed)
 	return 1;
 }
 
-int d3d11_scene_init(D3d11Scene *sc, unsigned ballast_seed)
+static int init_shaders_and_buffers(D3d11Scene *sc, unsigned ballast_seed)
 {
-	D3D_FEATURE_LEVEL fl = 0, want[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
-	D3D_DRIVER_TYPE drv[3] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_REFERENCE };
-	const char *dn[3] = { "HARDWARE", "WARP", "REFERENCE" };
-	HRESULT hr = E_FAIL;
-	int i;
-	D3D11_TEXTURE2D_DESC td;
 	D3D11_BUFFER_DESC bd;
 	D3D11_SUBRESOURCE_DATA sd;
 	HMODULE dc;
@@ -153,31 +147,6 @@ int d3d11_scene_init(D3d11Scene *sc, unsigned ballast_seed)
 	};
 	D3d11SceneState init;
 	Vtx dummy[D3D11_SCENE_MAX_QUADS * 6 + 32];
-
-	memset(sc, 0, sizeof(*sc));
-	sc->driver_name = "?";
-
-	for (i = 0; i < 3; i++) {
-		hr = D3D11CreateDevice(NULL, drv[i], NULL, 0, want, 2, D3D11_SDK_VERSION, &sc->dev, &fl, &sc->ctx);
-		if (SUCCEEDED(hr)) { sc->driver_name = dn[i]; break; }
-	}
-	if (FAILED(hr)) return 0;
-
-	ZeroMemory(&td, sizeof(td));
-	td.Width = D3D11_SCENE_W;
-	td.Height = D3D11_SCENE_H;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_RENDER_TARGET;
-	if (FAILED(ID3D11Device_CreateTexture2D(sc->dev, &td, NULL, &sc->rt))) return 0;
-	if (FAILED(ID3D11Device_CreateRenderTargetView(sc->dev, (ID3D11Resource *)sc->rt, NULL, &sc->rtv))) return 0;
-	td.Usage = D3D11_USAGE_STAGING;
-	td.BindFlags = 0;
-	td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-	if (FAILED(ID3D11Device_CreateTexture2D(sc->dev, &td, NULL, &sc->stg))) return 0;
 
 	dc = LoadLibraryA("d3dcompiler_47.dll");
 	D3DCompile = dc ? (PFN_D3DCompile)GetProcAddress(dc, "D3DCompile") : NULL;
@@ -204,14 +173,138 @@ int d3d11_scene_init(D3d11Scene *sc, unsigned ballast_seed)
 	bd.Usage = D3D11_USAGE_DEFAULT;
 	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	d3d11_scene_seed_state(&init, 1);
-	init.pad[0] = init.global_off[0];
-	init.pad[1] = init.global_off[1];
 	ZeroMemory(&sd, sizeof(sd));
 	sd.pSysMem = init.tint;
 	if (FAILED(ID3D11Device_CreateBuffer(sc->dev, &bd, &sd, &sc->cb))) return 0;
 
-	if (!create_ballast(sc, ballast_seed)) return 0;
+	return create_ballast(sc, ballast_seed);
+}
+
+int d3d11_scene_init_pipeline(D3d11Scene *sc, ID3D11Device *dev, ID3D11DeviceContext *ctx,
+			      unsigned ballast_seed)
+{
+	memset(sc, 0, sizeof(*sc));
+	sc->dev = dev;
+	sc->ctx = ctx;
+	sc->driver_name = "SWAPCHAIN";
+	if (dev) ID3D11Device_AddRef(dev);
+	if (ctx) ID3D11DeviceContext_AddRef(ctx);
+	return init_shaders_and_buffers(sc, ballast_seed);
+}
+
+void d3d11_scene_shutdown_pipeline(D3d11Scene *sc)
+{
+	unsigned i;
+	if (!sc) return;
+	for (i = 0; i < sc->ballast_n; i++)
+		if (sc->ballast[i]) ID3D11Texture2D_Release(sc->ballast[i]);
+	if (sc->il) ID3D11InputLayout_Release(sc->il);
+	if (sc->vs) ID3D11VertexShader_Release(sc->vs);
+	if (sc->ps) ID3D11PixelShader_Release(sc->ps);
+	if (sc->vb) ID3D11Buffer_Release(sc->vb);
+	if (sc->cb) ID3D11Buffer_Release(sc->cb);
+	if (sc->ctx) ID3D11DeviceContext_Release(sc->ctx);
+	if (sc->dev) ID3D11Device_Release(sc->dev);
+	memset(sc, 0, sizeof(*sc));
+}
+
+int d3d11_scene_init(D3d11Scene *sc, unsigned ballast_seed)
+{
+	D3D_FEATURE_LEVEL fl = 0, want[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+	D3D_DRIVER_TYPE drv[3] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_REFERENCE };
+	const char *dn[3] = { "HARDWARE", "WARP", "REFERENCE" };
+	HRESULT hr = E_FAIL;
+	int i;
+	D3D11_TEXTURE2D_DESC td;
+
+	memset(sc, 0, sizeof(*sc));
+	sc->driver_name = "?";
+
+	for (i = 0; i < 3; i++) {
+		hr = D3D11CreateDevice(NULL, drv[i], NULL, 0, want, 2, D3D11_SDK_VERSION, &sc->dev, &fl, &sc->ctx);
+		if (SUCCEEDED(hr)) { sc->driver_name = dn[i]; break; }
+	}
+	if (FAILED(hr)) return 0;
+
+	ZeroMemory(&td, sizeof(td));
+	td.Width = D3D11_SCENE_W;
+	td.Height = D3D11_SCENE_H;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET;
+	if (FAILED(ID3D11Device_CreateTexture2D(sc->dev, &td, NULL, &sc->rt))) return 0;
+	if (FAILED(ID3D11Device_CreateRenderTargetView(sc->dev, (ID3D11Resource *)sc->rt, NULL, &sc->rtv))) return 0;
+	td.Usage = D3D11_USAGE_STAGING;
+	td.BindFlags = 0;
+	td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	if (FAILED(ID3D11Device_CreateTexture2D(sc->dev, &td, NULL, &sc->stg))) return 0;
+
+	if (!init_shaders_and_buffers(sc, ballast_seed)) return 0;
 	return 1;
+}
+
+static unsigned scene_draw_and_read(D3d11Scene *mut, const D3d11SceneState *st,
+				    ID3D11RenderTargetView *rtv, ID3D11Texture2D *color_src,
+				    ID3D11Texture2D *staging, unsigned w, unsigned h,
+				    unsigned char *packed_rgba)
+{
+	float clear[4] = { 0.05f, 0.04f, 0.12f, 1.0f };
+	unsigned char cb_blob[32];
+	D3D11_VIEWPORT vp;
+	UINT stride = sizeof(Vtx), off = 0;
+	D3D11_MAPPED_SUBRESOURCE m;
+	unsigned y, fp = 0;
+	int nvert;
+
+	memcpy(cb_blob, st->tint, 16);
+	memcpy(cb_blob + 16, st->global_off, 8);
+	memset(cb_blob + 24, 0, 8);
+	ID3D11DeviceContext_UpdateSubresource(mut->ctx, (ID3D11Resource *)mut->cb, 0, NULL, cb_blob, 0, 0);
+	nvert = upload_vertices(mut, st);
+
+	ID3D11DeviceContext_OMSetRenderTargets(mut->ctx, 1, &rtv, NULL);
+	ZeroMemory(&vp, sizeof(vp));
+	vp.Width = (FLOAT)w;
+	vp.Height = (FLOAT)h;
+	vp.MaxDepth = 1.0f;
+	ID3D11DeviceContext_RSSetViewports(mut->ctx, 1, &vp);
+	ID3D11DeviceContext_ClearRenderTargetView(mut->ctx, rtv, clear);
+	ID3D11DeviceContext_IASetInputLayout(mut->ctx, mut->il);
+	ID3D11DeviceContext_IASetVertexBuffers(mut->ctx, 0, 1, &mut->vb, &stride, &off);
+	ID3D11DeviceContext_IASetPrimitiveTopology(mut->ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ID3D11DeviceContext_VSSetShader(mut->ctx, mut->vs, NULL, 0);
+	ID3D11DeviceContext_PSSetShader(mut->ctx, mut->ps, NULL, 0);
+	ID3D11DeviceContext_VSSetConstantBuffers(mut->ctx, 0, 1, &mut->cb);
+	ID3D11DeviceContext_Draw(mut->ctx, (UINT)nvert, 0);
+	ID3D11DeviceContext_Flush(mut->ctx);
+
+	if (color_src && staging)
+		ID3D11DeviceContext_CopyResource(mut->ctx, (ID3D11Resource *)staging, (ID3D11Resource *)color_src);
+	else if (mut->stg && mut->rt)
+		ID3D11DeviceContext_CopyResource(mut->ctx, (ID3D11Resource *)mut->stg, (ID3D11Resource *)mut->rt);
+
+	if (staging && SUCCEEDED(ID3D11DeviceContext_Map(mut->ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+		for (y = 0; y < h; y++)
+			memcpy(packed_rgba + y * w * 4, (char *)m.pData + y * m.RowPitch, w * 4);
+		ID3D11DeviceContext_Unmap(mut->ctx, (ID3D11Resource *)staging, 0);
+	} else if (mut->stg && SUCCEEDED(ID3D11DeviceContext_Map(mut->ctx, (ID3D11Resource *)mut->stg, 0, D3D11_MAP_READ, 0, &m))) {
+		for (y = 0; y < h; y++)
+			memcpy(packed_rgba + y * D3D11_SCENE_W * 4, (char *)m.pData + y * m.RowPitch, D3D11_SCENE_W * 4);
+		ID3D11DeviceContext_Unmap(mut->ctx, (ID3D11Resource *)mut->stg, 0);
+	}
+	fp = d3d11_scene_fnv1a(packed_rgba, w * h * 4);
+	return fp;
+}
+
+unsigned d3d11_scene_render_target(const D3d11Scene *sc, const D3d11SceneState *st,
+				   ID3D11RenderTargetView *rtv, ID3D11Texture2D *color_src,
+				   ID3D11Texture2D *staging, unsigned w, unsigned h,
+				   unsigned char *packed_rgba)
+{
+	return scene_draw_and_read((D3d11Scene *)sc, st, rtv, color_src, staging, w, h, packed_rgba);
 }
 
 void d3d11_scene_fill_refs(const D3d11Scene *sc, D3d11SceneSnapRefs *refs)
@@ -234,46 +327,9 @@ int d3d11_scene_device_recreated(const D3d11SceneSnapRefs *saved, const D3d11Sce
 
 unsigned d3d11_scene_render(const D3d11Scene *sc, const D3d11SceneState *st, unsigned char *packed_rgba)
 {
-	float clear[4] = { 0.05f, 0.04f, 0.12f, 1.0f };
-	unsigned char cb_blob[32];
-	D3D11_VIEWPORT vp;
-	UINT stride = sizeof(Vtx), off = 0;
-	D3D11_MAPPED_SUBRESOURCE m;
-	unsigned y, h = 0;
-	int nvert;
 	D3d11Scene *mut = (D3d11Scene *)sc;
-
-	memcpy(cb_blob, st->tint, 16);
-	memcpy(cb_blob + 16, st->global_off, 8);
-	memset(cb_blob + 24, 0, 8);
-	ID3D11DeviceContext_UpdateSubresource(mut->ctx, (ID3D11Resource *)mut->cb, 0, NULL, cb_blob, 0, 0);
-
-	nvert = upload_vertices(mut, st);
-
-	ID3D11DeviceContext_OMSetRenderTargets(mut->ctx, 1, &mut->rtv, NULL);
-	ZeroMemory(&vp, sizeof(vp));
-	vp.Width = (FLOAT)D3D11_SCENE_W;
-	vp.Height = (FLOAT)D3D11_SCENE_H;
-	vp.MaxDepth = 1.0f;
-	ID3D11DeviceContext_RSSetViewports(mut->ctx, 1, &vp);
-	ID3D11DeviceContext_ClearRenderTargetView(mut->ctx, mut->rtv, clear);
-	ID3D11DeviceContext_IASetInputLayout(mut->ctx, mut->il);
-	ID3D11DeviceContext_IASetVertexBuffers(mut->ctx, 0, 1, &mut->vb, &stride, &off);
-	ID3D11DeviceContext_IASetPrimitiveTopology(mut->ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	ID3D11DeviceContext_VSSetShader(mut->ctx, mut->vs, NULL, 0);
-	ID3D11DeviceContext_PSSetShader(mut->ctx, mut->ps, NULL, 0);
-	ID3D11DeviceContext_VSSetConstantBuffers(mut->ctx, 0, 1, &mut->cb);
-	ID3D11DeviceContext_Draw(mut->ctx, (UINT)nvert, 0);
-	ID3D11DeviceContext_Flush(mut->ctx);
-
-	ID3D11DeviceContext_CopyResource(mut->ctx, (ID3D11Resource *)mut->stg, (ID3D11Resource *)mut->rt);
-	if (SUCCEEDED(ID3D11DeviceContext_Map(mut->ctx, (ID3D11Resource *)mut->stg, 0, D3D11_MAP_READ, 0, &m))) {
-		for (y = 0; y < D3D11_SCENE_H; y++)
-			memcpy(packed_rgba + y * D3D11_SCENE_W * 4, (char *)m.pData + y * m.RowPitch, D3D11_SCENE_W * 4);
-		ID3D11DeviceContext_Unmap(mut->ctx, (ID3D11Resource *)mut->stg, 0);
-	}
-	h = d3d11_scene_fnv1a(packed_rgba, D3D11_SCENE_PIXBYTES);
-	return h;
+	return scene_draw_and_read(mut, st, mut->rtv, mut->rt, mut->stg, D3D11_SCENE_W, D3D11_SCENE_H,
+				   packed_rgba);
 }
 
 void d3d11_scene_flush(const D3d11Scene *sc)

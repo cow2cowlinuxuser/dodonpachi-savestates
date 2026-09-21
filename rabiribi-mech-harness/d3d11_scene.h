@@ -52,6 +52,13 @@ typedef struct D3d11Scene {
 unsigned d3d11_scene_fnv1a(const void *p, size_t n);
 void d3d11_scene_seed_state(D3d11SceneState *s, unsigned seed);
 int d3d11_scene_init(D3d11Scene *sc, unsigned ballast_seed);
+int d3d11_scene_init_pipeline(D3d11Scene *sc, ID3D11Device *dev, ID3D11DeviceContext *ctx,
+			      unsigned ballast_seed);
+void d3d11_scene_shutdown_pipeline(D3d11Scene *sc);
+unsigned d3d11_scene_render_target(const D3d11Scene *sc, const D3d11SceneState *st,
+				   ID3D11RenderTargetView *rtv, ID3D11Texture2D *color_src,
+				   ID3D11Texture2D *staging, unsigned w, unsigned h,
+				   unsigned char *packed_rgba);
 void d3d11_scene_fill_refs(const D3d11Scene *sc, D3d11SceneSnapRefs *refs);
 int d3d11_scene_device_recreated(const D3d11SceneSnapRefs *saved, const D3d11Scene *live);
 unsigned d3d11_scene_render(const D3d11Scene *sc, const D3d11SceneState *st, unsigned char *packed_rgba);

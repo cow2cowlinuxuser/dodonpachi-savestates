@@ -277,7 +277,7 @@ static int xsession(const char *cmd, const char *file, unsigned seed)
 		if (strcmp(cmd, "prove") == 0) {
 			free(sg); free(sd); free(sa);
 			printf("%s: process B must recreate all three pins (%d stale signals)\n",
-			       dead >= 8 ? "PASS" : "FAIL", dead);
+			       dead >= 3 ? "PASS" : "FAIL", dead);
 			return dead >= 3 ? 0 : 1;
 		}
 

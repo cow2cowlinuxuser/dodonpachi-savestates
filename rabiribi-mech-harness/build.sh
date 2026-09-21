@@ -65,3 +65,7 @@ echo "built build/present_cb_harness.exe and build/present_cb_harness32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/combined_harness.exe   combined_harness.c d3d11_scene.c -ld3d11 -ldxgi -lole32 -luuid -lgdi32 -luser32
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/combined_harness32.exe combined_harness.c d3d11_scene.c -ld3d11 -ldxgi -lole32 -luuid -lgdi32 -luser32
 echo "built build/combined_harness.exe and build/combined_harness32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/dxgi_swapchain_harness.exe   dxgi_swapchain_harness.c d3d11_scene.c -ld3d11 -ldxgi -luser32
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/dxgi_swapchain_harness32.exe dxgi_swapchain_harness.c d3d11_scene.c -ld3d11 -ldxgi -luser32
+echo "built build/dxgi_swapchain_harness.exe and build/dxgi_swapchain_harness32.exe"

@@ -32,14 +32,22 @@ Exit code is 0 when the soak came back byte-for-byte on every restore.
 
 1. **Negative controls** - three deliberate faults that must each be detected,
    so a silent pass is only trusted after the instrument is shown to bite.
-2. **Boundary map** - for each failure mode, the pitfall (mitigation OFF, must be
-   DETECTED) beside the mitigation (ON, must stay clean):
-   Class C mid-mutation, capture-via-SuspendThread, Class A outward straddle,
-   Class B inward straddle, and the DirectSound cursor split.
-3. **Soak** - all mitigations engaged, thousands of cycles, expecting zero
-   failures; the confidence statement.
+2. **Restore-side boundary map** - for each restore failure mode, the pitfall
+   (mitigation OFF, must be DETECTED) beside the mitigation (ON, must stay
+   clean): Class A outward straddle, Class B inward straddle, DirectSound cursor
+   split.
+3. **Capture strategy table** - the heart of it. For RACE / SUSPEND /
+   SUSPEND+SETTLE / SUSPEND+VERIFY / BARRIER it reports committed / refused /
+   poisoned. *Poisoned* (a committed snapshot that then restores wrong) is the
+   number that matters: RACE and SUSPEND poison; **SUSPEND+VERIFY never does**,
+   because it verifies the captured bytes and refuses rather than commit a torn
+   snapshot. A forced-refusal row proves a refusal is a retry, not a corruption.
+4. **Soak** - thousands of cycles with the portable fix (SUSPEND+VERIFY) and the
+   Class A/B stressors on, expecting zero poisoned slots; the confidence
+   statement.
 
-See [FINDINGS.md](FINDINGS.md) for the measured bounds and what each means.
+See [FINDINGS.md](FINDINGS.md) for the measured bounds, the capture fix, and the
+concrete change recommended for the real engine.
 
 ## Boundaries modeled (all from the source repo's docs)
 

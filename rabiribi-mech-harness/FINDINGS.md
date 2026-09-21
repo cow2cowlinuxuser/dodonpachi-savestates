@@ -132,15 +132,63 @@ With every mapped mitigation engaged, and Class A + Class B stressors active, th
 soak ran **5000 save/restore cycles, 5000 restores, 0 failures**
 (`id=0 det=0 heap=0 A=0 B=0 cursor=0`), reproduced at 1/6/8/12 workers.
 
-## One finding that is not a bound but matters
+## The blocker, and the fix: never commit a poisoned capture
 
-A bad capture is **not self-healing**. A pitfall arm that photographs a torn or
-inconsistent arena writes that damage back, and every subsequent restore
-reproduces it forever - which is why each experiment here heals to a clean world
-before it runs. Operationally: a save taken at a bad instant is not a transient
-you can restore away from; it is a poisoned slot. That argues for spending the
-cost at *capture* time (the safe-point barrier) rather than hoping a later
-restore recovers.
+A bad capture is **not self-healing**. A save taken while the world is
+inconsistent writes that damage into the slot, and every later restore
+reproduces it. A poisoned slot is permanent, not a transient you can restore
+away from. This is the current blocker, and the evidence points at *our capture
+handling*, not Wine or Windows: the copy is fine; the instant we choose to copy
+is the problem.
+
+The trivial win - a cooperative safe-point barrier - is **not portable**: the
+game's and Mono's threads are not ours to park. So the fix has to work with what
+the engine actually has (`SuspendThread`). The harness models capture as a
+strategy and measures the only number that matters, *poisoned* (a committed
+snapshot that then restores wrong):
+
+| strategy | committed | refused | poisoned | verdict |
+| --- | --- | --- | --- | --- |
+| RACE (copy while running) | 200 | 0 | 200 | POISONS |
+| SUSPEND (engine today, no settle) | 200 | 0 | ~199 | POISONS |
+| SUSPEND+SETTLE (retry until no writer in a known hot region) | 200 | 0 | 0 | safe\* |
+| **SUSPEND+VERIFY** (copy to scratch, verify, commit only if clean, else retry/refuse) | 200 | 0 | **0** | **safe** |
+| BARRIER (cooperative safe point) | 200 | 0 | 0 | safe (not portable) |
+| SUSPEND+VERIFY, retry budget = 2 | 84 | 116 | **0** | safe (refused, not corrupt) |
+
+Soak with **SUSPEND+VERIFY** and Class A+B stressors active:
+**4000 save/restore cycles, 4000 committed, 0 refused, 0 poisoned**
+(`id=0 det=0 heap=0 A=0 B=0 cursor=0`), ~2.3 retries per save.
+
+\* SETTLE shows 0 here, but its safety is only as good as its list of hot
+regions - it trusts that "no thread is in a region I know about" means
+consistent. VERIFY makes no such assumption: it checks the actual captured bytes
+(identity through each object's own callback + checksum, plus a heap-metadata
+walk) and commits only what is proven consistent. That is why VERIFY is the
+recommendation.
+
+### The recommended change to the real engine
+
+In the save path, after the suspend-and-copy, **run the same consistency oracles
+on the freshly captured snapshot that the restore path already runs, and commit
+the snapshot only if it passes; otherwise resume, back off, and retry, and after
+a bounded number of tries refuse the save.** The engine already validates heaps
+before a save and fails closed on the restore side; this simply extends that
+discipline to *committing* a capture. Concretely:
+
+1. Do not skip the consistency gate under Wine. The whole-module settle loop is
+   what gets skipped there; a post-capture verify is cheap (it is the checks
+   already written for restore) and does not depend on enumerating hot regions.
+2. Capture into scratch, resume the world immediately (minimal suspend time),
+   then verify the scratch offline; only swap it into the live slot if clean.
+3. On repeated failure, **refuse the save** and keep the last good slot. A
+   refused save is a retry the caller can surface; a poisoned slot is a silent
+   corruption discovered frames later. The whole point of the bounds map is to
+   trade the second for the first.
+
+The cost is retries (measured ~2-3 per save at this contention), which is the
+same cost the settle loop pays - but bounded, and paid only to *avoid* poisoning
+rather than to guess at safe instants.
 
 ## What this does and does not establish
 

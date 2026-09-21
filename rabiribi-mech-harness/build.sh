@@ -57,3 +57,11 @@ echo "built build/audio_coexist.exe and build/audio_coexist32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/audio_xsession.exe   audio_xsession.c -lole32 -luuid
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/audio_xsession32.exe audio_xsession.c -lole32 -luuid
 echo "built build/audio_xsession.exe and build/audio_xsession32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/present_cb_harness.exe   present_cb_harness.c d3d11_scene.c -ld3d11 -ldxgi
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/present_cb_harness32.exe present_cb_harness.c d3d11_scene.c -ld3d11 -ldxgi
+echo "built build/present_cb_harness.exe and build/present_cb_harness32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/combined_harness.exe   combined_harness.c d3d11_scene.c -ld3d11 -ldxgi -lole32 -luuid -lgdi32 -luser32
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/combined_harness32.exe combined_harness.c d3d11_scene.c -ld3d11 -ldxgi -lole32 -luuid -lgdi32 -luser32
+echo "built build/combined_harness.exe and build/combined_harness32.exe"

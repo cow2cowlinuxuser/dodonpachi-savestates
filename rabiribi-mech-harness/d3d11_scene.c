@@ -276,6 +276,12 @@ unsigned d3d11_scene_render(const D3d11Scene *sc, const D3d11SceneState *st, uns
 	return h;
 }
 
+void d3d11_scene_flush(const D3d11Scene *sc)
+{
+	if (sc && sc->ctx)
+		ID3D11DeviceContext_Flush(sc->ctx);
+}
+
 void d3d11_scene_shutdown(D3d11Scene *sc)
 {
 	unsigned i;

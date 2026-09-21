@@ -234,6 +234,24 @@ D3D device in `--retire`), not restored as a raw value. Same-session persistence
 (shown here) and cross-session recreation are two different problems; this maps
 the first and names the second.
 
+### COM audio / XAudio2 (`audio_probe.c`, `audio_coexist.c`, `audio_xsession.c`)
+
+Same GDI-pattern for a COM audio engine on Wine (software-only VM):
+
+```bash
+wine build/audio_probe32.exe
+wine build/audio_coexist32.exe 150
+wine build/audio_xsession32.exe save snap.bin 777
+wine build/audio_xsession32.exe prove snap.bin
+wine build/audio_xsession32.exe restore snap.bin
+```
+
+On this headless cloud VM: `XAudio2Create` works; `CreateMasteringVoice` does not
+(no ALSA/Pulse device). The harness pins **`IXAudio2` engine only** and models PCM/cursor
+splits in client memory. Same-session **150/150** COM valid + split/reconcile; cross-session
+**PASS** on new engine + bit-exact seed PCM (see Project store sitting under
+`docs/mech-harness/audio-com-gdi-pattern-sitting.md`).
+
 ## Scope
 
 The CPU-side harness exercises the *mechanics* of save/restore for these

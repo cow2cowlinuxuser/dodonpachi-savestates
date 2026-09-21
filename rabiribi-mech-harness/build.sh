@@ -44,3 +44,16 @@ echo "built build/d3d11_coexist.exe and build/d3d11_coexist32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/gdi_coexist.exe   gdi_coexist.c -lgdi32 -luser32
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/gdi_coexist32.exe gdi_coexist.c -lgdi32 -luser32
 echo "built build/gdi_coexist.exe and build/gdi_coexist32.exe"
+
+# COM audio probe (XAudio2 / mmdevapi / DirectSound under Wine).
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/audio_probe.exe   audio_probe.c -lole32 -luuid -ldsound
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/audio_probe32.exe audio_probe.c -lole32 -luuid -ldsound
+echo "built build/audio_probe.exe and build/audio_probe32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/audio_coexist.exe   audio_coexist.c -lole32 -luuid
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/audio_coexist32.exe audio_coexist.c -lole32 -luuid
+echo "built build/audio_coexist.exe and build/audio_coexist32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/audio_xsession.exe   audio_xsession.c -lole32 -luuid
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/audio_xsession32.exe audio_xsession.c -lole32 -luuid
+echo "built build/audio_xsession.exe and build/audio_xsession32.exe"

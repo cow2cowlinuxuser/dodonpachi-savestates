@@ -192,6 +192,48 @@ not the blocker. The next step is depth: bring the wined3d object *graph*
 (views, buffers, shaders, driver-side allocations) under the same handle/verify
 discipline rather than a single device pointer.
 
+### `gdi_coexist.c` - GDI/USER32 as a possible upstream blocker
+
+The docs flag GDI/USER32 ("USER32/GDI not rewound; Proton A->B dies in USER32").
+This harness stands up a real window + a GDI memory DC + a DIB section, holds the
+`HWND`/`HDC`/`HBITMAP` handles inside the rewound arena, and runs the
+capture/restore loop around them.
+
+```bash
+wine build/gdi_coexist.exe 200
+```
+
+Measured (200 cycles, GDI/USER live throughout):
+
+| check | result |
+| --- | --- |
+| handles valid after restore | **200/200** - HWND/HDC/HBITMAP survive the rewind |
+| GDI content split observed | **200/200** - the DIB pixels are NOT rewound |
+| GDI reconciled by redraw | **200/200** - redraw from rewound state fixes it |
+| arena poisoned / deadlock | 0 / none (ran to completion) |
+
+Empirical finding, in the same Class A/B/split vocabulary:
+
+- **GDI/USER handles are kernel-side and persist across the rewind.** The handle
+  value rewinds with the arena and still addresses the live win32k object, so
+  *same-session* a held HWND/HDC/HBITMAP is valid after a restore. Not a blocker
+  for handle validity.
+- **GDI object *content* is a split, like the audio cursor.** A DIB's pixels
+  live on the GDI side, outside our snapshot; a process-memory rewind does not
+  touch them. This is a real desync source and must be reconciled - here by
+  redrawing the content from the rewound logical state (200/200).
+- **A live window + GDI + message pump does not block the cooperative capture.**
+  Because we never `SuspendThread` the UI thread, no win32k lock is ever held by
+  a frozen thread, so there is no deadlock.
+
+Caveat that matches the docs' "Proton A->B dies in USER32": the *cross-session*
+case is different. HWND/HDC/HBITMAP values belong to a process's own USER/GDI
+handle namespace, so a handle saved in session A is meaningless in session B -
+it must be recreated and re-pinned (the same object-retirement pattern as the
+D3D device in `--retire`), not restored as a raw value. Same-session persistence
+(shown here) and cross-session recreation are two different problems; this maps
+the first and names the second.
+
 ## Scope
 
 The CPU-side harness exercises the *mechanics* of save/restore for these

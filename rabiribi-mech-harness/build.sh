@@ -39,3 +39,8 @@ echo "built build/d3d11_xsession.exe and build/d3d11_xsession32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/d3d11_coexist.exe   d3d11_coexist.c -ld3d11 -ldxgi
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/d3d11_coexist32.exe d3d11_coexist.c -ld3d11 -ldxgi
 echo "built build/d3d11_coexist.exe and build/d3d11_coexist32.exe"
+
+# GDI/USER coexistence: savestate loop WITH a live window + GDI DIB/DC.
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/gdi_coexist.exe   gdi_coexist.c -lgdi32 -luser32
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/gdi_coexist32.exe gdi_coexist.c -lgdi32 -luser32
+echo "built build/gdi_coexist.exe and build/gdi_coexist32.exe"

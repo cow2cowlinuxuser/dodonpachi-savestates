@@ -81,3 +81,7 @@ echo "built build/xa2_voice_harness.exe and build/xa2_voice_harness32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/thread_policy_harness.exe   thread_policy_harness.c d3d11_scene.c -ld3d11 -ldxgi -luser32
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/thread_policy_harness32.exe thread_policy_harness.c d3d11_scene.c -ld3d11 -ldxgi -luser32
 echo "built build/thread_policy_harness.exe and build/thread_policy_harness32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/gdi_dxgi_harness.exe   gdi_dxgi_harness.c d3d11_scene.c -ld3d11 -ldxgi -lgdi32 -luser32
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/gdi_dxgi_harness32.exe gdi_dxgi_harness.c d3d11_scene.c -ld3d11 -ldxgi -lgdi32 -luser32
+echo "built build/gdi_dxgi_harness.exe and build/gdi_dxgi_harness32.exe"

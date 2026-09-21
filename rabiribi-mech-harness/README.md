@@ -62,10 +62,38 @@ concrete change recommended for the real engine.
 | Heap metadata | `restore_invariants.md` #2 | — (always checked) | free-list walk, `HeapValidate`-style |
 | Thread set | `restore_invariants.md` #4 | — (always checked) | fresh/gone roster diff |
 
+## D3D11 on the CPU (`d3d11_probe.c`) - toward GPU state under restore
+
+The open question is whether GPU-side D3D11 state can die and live by the same
+in-process restore mechanism. Step one is a D3D11 device that renders with no
+real GPU and no window, so it can eventually be driven under the harness.
+
+`d3d11_probe.c` is that step: a headless D3D11 program (device -> offscreen
+render target -> clear -> one shaded triangle with runtime-compiled shaders ->
+staging read-back -> dump). Under Wine it routes `HARDWARE` through wined3d to
+the software backend (llvmpipe / lavapipe), so the whole D3D11 pipeline runs on
+the CPU.
+
+```bash
+./build.sh
+WINEPREFIX=$HOME/.wine-ddp DISPLAY=:1 wine build/d3d11_probe.exe out.ppm   # or d3d11_probe32.exe
+```
+
+Measured here: device created at **feature level 11.0** on the CPU backend, both
+PE32 and 64-bit; the triangle renders (corner = magenta clear, interior =
+Gouraud blend). That establishes the substrate. The next step is to place the
+D3D11 device's own writable state (and the wined3d/driver objects that straddle
+the boundary) into the capture/verify/restore loop and find where the GPU side
+sits in the same Class A/B/C map - in particular which device state is present
+(outside the snapshot) versus rewound, and whether a verify-or-refuse capture
+holds when a GPU/driver object is live.
+
 ## Scope
 
-This exercises the *mechanics* of save/restore for these ownership shapes. It
-does not reproduce the real engine's live-heap rewind, stack/context rewind, or
-GPU/audio device ownership - those are Windows-internal and are what the real
-`savestate.c` (and its Wine notes) wrestle with. The value here is the map: each
-bound is named, provokable on command, and shown to have a way around it.
+The CPU-side harness exercises the *mechanics* of save/restore for these
+ownership shapes. It does not yet reproduce the real engine's live-heap rewind,
+stack/context rewind, or full GPU/audio device ownership - those are
+Windows-internal and are what the real `savestate.c` (and its Wine notes)
+wrestle with. The value here is the map: each bound is named, provokable on
+command, and shown to have a way around it - and now a CPU-runnable D3D11 device
+to extend that map onto the GPU side.

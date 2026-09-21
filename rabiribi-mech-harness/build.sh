@@ -85,3 +85,7 @@ echo "built build/thread_policy_harness.exe and build/thread_policy_harness32.ex
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/gdi_dxgi_harness.exe   gdi_dxgi_harness.c d3d11_scene.c -ld3d11 -ldxgi -lgdi32 -luser32
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/gdi_dxgi_harness32.exe gdi_dxgi_harness.c d3d11_scene.c -ld3d11 -ldxgi -lgdi32 -luser32
 echo "built build/gdi_dxgi_harness.exe and build/gdi_dxgi_harness32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/heap_ownership_harness.exe   heap_ownership_harness.c
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/heap_ownership_harness32.exe heap_ownership_harness.c
+echo "built build/heap_ownership_harness.exe and build/heap_ownership_harness32.exe"

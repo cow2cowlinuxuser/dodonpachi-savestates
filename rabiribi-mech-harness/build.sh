@@ -69,3 +69,7 @@ echo "built build/combined_harness.exe and build/combined_harness32.exe"
 "$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/dxgi_swapchain_harness.exe   dxgi_swapchain_harness.c d3d11_scene.c -ld3d11 -ldxgi -luser32
 "$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/dxgi_swapchain_harness32.exe dxgi_swapchain_harness.c d3d11_scene.c -ld3d11 -ldxgi -luser32
 echo "built build/dxgi_swapchain_harness.exe and build/dxgi_swapchain_harness32.exe"
+
+"$ZIG" cc "${WARN[@]}" -target x86_64-windows-gnu -o build/atlas_batch_harness.exe   atlas_batch_harness.c d3d11_scene.c -ld3d11 -ldxgi
+"$ZIG" cc "${WARN[@]}" -target x86-windows-gnu    -o build/atlas_batch_harness32.exe atlas_batch_harness.c d3d11_scene.c -ld3d11 -ldxgi
+echo "built build/atlas_batch_harness.exe and build/atlas_batch_harness32.exe"

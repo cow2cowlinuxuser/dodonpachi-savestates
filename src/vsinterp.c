@@ -1,8 +1,11 @@
+/* See d3d9_sw.c: renderer statics, taken whole by a merge. */
+#pragma clang section bss = ".swbss" data = ".swdata"
 #include "vsinterp.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include "logdir.h"
 
 typedef struct VsReg {
 	float v[4];
@@ -828,7 +831,7 @@ int vs_exec(const DWORD *code, UINT code_bytes, const float constants[256][4], u
 	{
 		static int once;
 		if (++once == 1) {
-			FILE *f = fopen("d3d9_sw.log", "a");
+			FILE *f = swlog_fopen("d3d9_sw.log", "a");
 			if (f) {
 				fprintf(f,
 					"[d3d9_sw] vs_out rast=(%.3f,%.3f,%.3f,%.3f) tex0=(%.4f,%.4f) tex1=(%.4f,%.4f) attr=(%.3f,%.3f,%.3f,%.3f) vin0=(%.3f,%.3f,%.3f) vin1=(%.3f,%.3f)\n",

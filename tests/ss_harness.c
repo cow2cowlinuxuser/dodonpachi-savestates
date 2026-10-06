@@ -739,6 +739,22 @@ typedef struct {
 	LONG call_failed; /* threw when it should not have */
 	LONG call_wrong;  /* returned the wrong number */
 	LONG bucket[8]; /* <1ms, <2, <4, <8, <16, <32, <64, >=64 */
+
+	/* --- scenario 3: heap identity
+	 *
+	 * Both handles live here rather than in a global for the reason the whole
+	 * test turns on: a handle rewound along with everything else would come back
+	 * null for the post-save heap, and the harness would then report "no heap"
+	 * where the game reports "a heap Windows has forgotten". Held, they stay
+	 * exactly what the game's threads still hold. */
+	HANDLE pre_heap;  /* created before the first save, so every snapshot has it */
+	HANDLE post_heap; /* created after a save, so no snapshot does */
+	void *pre_blk[64];
+	void *post_blk[64];
+	LONG heap_checks;
+	LONG pre_bad;  /* the control: this one should never go wrong */
+	LONG post_bad; /* the hypothesis */
+
 	Rec rec[REC_MAX];
 } Held;
 
@@ -873,8 +889,11 @@ static int verify_mono(const char *when, int cycle)
 
 /* -------------------------------------------------------------------- driver */
 
-enum { MODE_SYNTH, MODE_MONO };
+enum { MODE_SYNTH, MODE_MONO, MODE_HEAP };
 static int g_mode;
+
+/* Defined with the rest of scenario 3, below the dispatcher that calls it. */
+static int verify_heap(const char *when, int cycle);
 
 /* Names an address the way the fault logger does, so the two can be compared by
  * eye: owning module and offset, or the bare address when it owns nothing. */
@@ -1176,7 +1195,192 @@ static void wait_for_progress(void)
 
 static int verify_now(const char *when, int cycle)
 {
+	if (g_mode == MODE_HEAP)
+		return verify_heap(when, cycle);
 	return g_mode == MODE_MONO ? verify_mono(when, cycle) : verify_synth(when, cycle);
+}
+
+/* ---------------------------------------------------------------- scenario 3 */
+
+/* Heap identity across a restore.
+ *
+ * On 2026-09-09 the game froze with a call to address zero inside
+ * ntdll!RtlAbPostRelease, reached from RtlLeaveCriticalSection releasing a heap
+ * lock, reached from RtlpLocalInfoAllocFromCache - the low fragmentation heap's
+ * front end. The heap in question was 0d6e0000, and cdb, having walked the heap
+ * regions, did not classify it as a heap at all: "Usage: <unknown>". A thread
+ * was allocating from a heap Windows no longer believed existed.
+ *
+ * The theory that fits is heap identity rather than block contents. A heap
+ * created after the snapshot is not in it; the restore rewinds the process heap
+ * list to a state that predates the heap, so ntdll forgets it, while the handle
+ * and the memory both survive in the hands of whatever is still using them. If
+ * that is right it should reproduce here with no game, no Steam and no audio -
+ * and if it does not reproduce, the theory is wrong and a week of chasing the
+ * low fragmentation heap gets called off.
+ *
+ * Every check below is one Windows can answer about itself. The point is not to
+ * assert that our blocks came back; it is to ask ntdll whether it still knows
+ * what a heap is, which is the question the crash raised. */
+
+#define HEAP_BLKS 64
+#define HEAP_BLKSZ 56 /* small and uniform, so the LFH takes over the bucket */
+
+/* The front end only engages after enough same-sized allocations pass through
+ * the same bucket, and it is the front end that crashed. A heap that never got
+ * there would be a heap the failure cannot happen in. */
+static void heap_warm(HANDLE h, void **blk, int n)
+{
+	int i, round;
+
+	for (round = 0; round < 4; round++) {
+		for (i = 0; i < n; i++) {
+			if (blk[i])
+				HeapFree(h, 0, blk[i]);
+			blk[i] = HeapAlloc(h, 0, HEAP_BLKSZ);
+			if (blk[i])
+				memset(blk[i], 0xA5, HEAP_BLKSZ);
+		}
+	}
+}
+
+static HANDLE heap_make(void **blk, int n)
+{
+	HANDLE h = HeapCreate(0, 0, 0);
+
+	if (h)
+		heap_warm(h, blk, n);
+	return h;
+}
+
+/* Membership in the process heap list, which is the specific thing cdb reported
+ * as missing. Asked with GetProcessHeaps rather than by reading ntdll's
+ * structures, so the answer does not depend on a Windows build. */
+static int heap_listed(HANDLE h)
+{
+	HANDLE list[256];
+	DWORD n, i;
+
+	if (!h)
+		return 0;
+	n = GetProcessHeaps(256, list);
+	if (n > 256)
+		n = 256;
+	for (i = 0; i < n; i++)
+		if (list[i] == h)
+			return 1;
+	return 0;
+}
+
+static int heap_committed(HANDLE h)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+
+	if (!h)
+		return 0;
+	if (VirtualQuery((LPCVOID)h, &mbi, sizeof(mbi)) != sizeof(mbi))
+		return 0;
+	return mbi.State == MEM_COMMIT;
+}
+
+/* Ordered cheapest and safest first. Listing and committal are pure queries;
+ * HeapValidate walks the structures but is designed to survive what it finds;
+ * the allocation is last because it is the operation that actually died, and if
+ * the earlier checks have already failed we would rather report that than take
+ * the harness down proving it. */
+static int heap_probe(const char *tag, HANDLE h, const char *when, int cycle)
+{
+	int listed = heap_listed(h), commit = heap_committed(h), valid = 0, bad = 0;
+	void *p;
+
+	if (!h)
+		return 0;
+	if (!listed) {
+		printf("cycle %d %s: the %s heap %p is NOT in the process heap list - "
+		       "Windows has forgotten it\n",
+		       cycle, when, tag, (void *)h);
+		bad++;
+	}
+	if (!commit) {
+		printf("cycle %d %s: the %s heap %p is no longer committed memory\n", cycle,
+		       when, tag, (void *)h);
+		bad++;
+	}
+	if (!listed || !commit)
+		return bad; /* allocating from it now would only kill the messenger */
+
+	valid = HeapValidate(h, 0, NULL) != 0;
+	if (!valid) {
+		printf("cycle %d %s: HeapValidate says the %s heap %p is inconsistent\n",
+		       cycle, when, tag, (void *)h);
+		bad++;
+	}
+
+	/* The operation from the crash: an allocation small enough to go through the
+	 * low fragmentation front end. */
+	p = HeapAlloc(h, 0, HEAP_BLKSZ);
+	if (!p) {
+		printf("cycle %d %s: HeapAlloc from the %s heap %p returned nothing\n",
+		       cycle, when, tag, (void *)h);
+		bad++;
+	} else {
+		memset(p, 0x5A, HEAP_BLKSZ);
+		HeapFree(h, 0, p);
+	}
+	return bad;
+}
+
+static int verify_heap(const char *when, int cycle)
+{
+	int bad = 0;
+
+	g_held->heap_checks++;
+	bad += heap_probe("pre-save", g_held->pre_heap, when, cycle);
+	if (bad)
+		g_held->pre_bad++;
+	{
+		int pb = heap_probe("post-save", g_held->post_heap, when, cycle);
+
+		if (pb)
+			g_held->post_bad++;
+		bad += pb;
+	}
+	return bad;
+}
+
+/* Keeps both heaps busy so the snapshot lands mid-allocation as often as
+ * possible, which is the state the game was in. */
+static DWORD WINAPI churner(LPVOID p)
+{
+	void *mine[16];
+	int i;
+
+	(void)p;
+	memset(mine, 0, sizeof(mine));
+	while (!InterlockedCompareExchange(&g_stop, 0, 0)) {
+		HANDLE h = g_held->post_heap ? g_held->post_heap : g_held->pre_heap;
+
+		if (!h) {
+			Sleep(1);
+			continue;
+		}
+		for (i = 0; i < 16; i++) {
+			if (mine[i])
+				HeapFree(h, 0, mine[i]);
+			mine[i] = HeapAlloc(h, 0, HEAP_BLKSZ);
+		}
+		/* Freed against the same heap they came from before that heap can
+		 * change under us; leaking them into the next round would be our bug,
+		 * not the engine's. */
+		for (i = 0; i < 16; i++) {
+			if (mine[i])
+				HeapFree(h, 0, mine[i]);
+			mine[i] = NULL;
+		}
+		InterlockedIncrement(&g_progress);
+		Sleep(0);
+	}
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -1194,9 +1398,12 @@ int main(int argc, char **argv)
 	 * crash takes the explanation with it. The whole value of a harness is that
 	 * it says what happened. */
 	setvbuf(stdout, NULL, _IONBF, 0);
-	g_mode = strcmp(mode, "mono") == 0 ? MODE_MONO : MODE_SYNTH;
+	g_mode = strcmp(mode, "mono") == 0	? MODE_MONO
+		 : strcmp(mode, "heap") == 0	? MODE_HEAP
+						: MODE_SYNTH;
 	printf("savestate harness: %d cycles, %d worker thread(s), mode %s\n", cycles,
-	       nthreads, g_mode == MODE_MONO ? "mono" : "synth");
+	       nthreads,
+	       g_mode == MODE_MONO ? "mono" : g_mode == MODE_HEAP ? "heap" : "synth");
 
 	/* Before the runtime, so the interposed allocator and the exit hooks are in
 	 * place for everything mono goes on to do. */
@@ -1215,6 +1422,19 @@ int main(int argc, char **argv)
 		       "labelled mono proves nothing\n");
 		return 3;
 	}
+	if (g_mode == MODE_HEAP) {
+		/* The control heap. Created before any snapshot exists, so every
+		 * snapshot contains its registration and a restore puts back a world it
+		 * was always part of. If this one ever fails the test is measuring
+		 * something other than what it claims to. */
+		g_held->pre_heap = heap_make(g_held->pre_blk, HEAP_BLKS);
+		if (!g_held->pre_heap) {
+			printf("could not create the pre-save heap\n");
+			return 4;
+		}
+		printf("heap: control heap %p created and warmed before the first save\n",
+		       g_held->pre_heap);
+	}
 	if (g_mode == MODE_SYNTH) {
 		printf("seeding table\n");
 		g_table = table_new(8);
@@ -1224,7 +1444,10 @@ int main(int argc, char **argv)
 
 	printf("starting workers\n");
 	for (i = 0; i < nthreads; i++) {
-		th[i] = CreateThread(NULL, 0, g_mode == MODE_MONO ? jitter : filler,
+		th[i] = CreateThread(NULL, 0,
+				     g_mode == MODE_MONO   ? jitter
+				     : g_mode == MODE_HEAP ? churner
+							   : filler,
 				     (LPVOID)(intptr_t)i, 0, NULL);
 		/* Kept where a restore cannot rewind them, so that "nothing progressed"
 		 * can be told apart from "there is nobody left to progress". */
@@ -1370,6 +1593,24 @@ int main(int argc, char **argv)
 			printf("cycle %ld: ALREADY inconsistent before the restore - the "
 			       "fault is not the savestate's\n",
 			       (long)g_held->cycle);
+		/* The whole scenario, in one place: a heap that comes into existence
+		 * after the snapshot was taken. Created here, between a genuine save and
+		 * the load that undoes it, so there is no snapshot anywhere that knows
+		 * about it - which is exactly the position the game's 0d6e0000 was in.
+		 *
+		 * Made once and then kept, because the interesting question is what
+		 * happens to it on the second and tenth restore, not just the first. */
+		if (g_mode == MODE_HEAP && !g_held->post_heap) {
+			g_held->post_heap = heap_make(g_held->post_blk, HEAP_BLKS);
+			printf("cycle %ld: created heap %p AFTER the save - no snapshot "
+			       "contains it\n",
+			       (long)g_held->cycle, (void *)g_held->post_heap);
+			if (!heap_probe("post-save", g_held->post_heap, "before restore",
+					(int)g_held->cycle))
+				printf("cycle %ld: and it is healthy before the restore, "
+				       "which is the control for everything below\n",
+				       (long)g_held->cycle);
+		}
 		Sleep(5);
 		if (!savestate_load(0)) {
 			printf("cycle %ld: load refused\n", (long)g_held->cycle);
@@ -1398,6 +1639,22 @@ int main(int argc, char **argv)
 	       (long)g_held->bad,
 	       (long)(g_mode == MODE_MONO ? g_held->caught_jitting
 					  : g_held->caught_filling));
+	if (g_mode == MODE_HEAP) {
+		printf("heap identity: %ld check(s), control heap bad %ld time(s), "
+		       "post-save heap bad %ld time(s)\n",
+		       (long)g_held->heap_checks, (long)g_held->pre_bad,
+		       (long)g_held->post_bad);
+		/* Spelled out because the negative result matters as much as the
+		 * positive one and is easier to misread. */
+		if (!g_held->post_bad && g_held->restores)
+			printf("heap identity: a heap created after the snapshot survived "
+			       "%ld restore(s) intact, so the game's forgotten heap is NOT "
+			       "explained by post-save creation alone\n",
+			       (long)g_held->restores);
+		else if (g_held->post_bad && !g_held->pre_bad)
+			printf("heap identity: REPRODUCED - only the heap created after the "
+			       "snapshot goes wrong, and the control never does\n");
+	}
 	if (g_mode == MODE_MONO) {
 		printf("oracle managed identity: %ld check(s) across %ld restore(s), %ld "
 		       "returned null, %ld returned a different thread\n",

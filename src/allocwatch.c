@@ -42,6 +42,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include "logdir.h"
 
 #ifndef EXCEPTION_ACCESS_VIOLATION
 #define EXCEPTION_ACCESS_VIOLATION 0xC0000005L
@@ -82,8 +83,7 @@ static void aw_raw(const char *fmt, ...)
 	va_end(ap);
 	if (n <= 0)
 		return;
-	h = CreateFileA("d3d9_sw_allocwatch.txt", FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
-			OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	h = swlog_create("d3d9_sw_allocwatch.txt", OPEN_ALWAYS);
 	if (h == INVALID_HANDLE_VALUE)
 		return;
 	SetFilePointer(h, 0, NULL, FILE_END);

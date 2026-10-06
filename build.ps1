@@ -19,13 +19,19 @@ Write-Host "using $zig (zig $(& $zig version))"
 $warn = @("-O2", "-Wall", "-Wno-incompatible-function-pointer-types")
 $src = @(
   "src/d3d9_sw.c", "src/swrast.c", "src/savestate.c", "src/vsinterp.c",
-  "src/trace.c", "src/tramp.c", "src/allocwatch.c", "src/d3d9.def"
+  "src/trace.c", "src/tramp.c", "src/allocwatch.c", "src/dsoundhook.c",
+  "src/ds_sw.c", "src/xa2_sw.c", "src/gameheap.c", "src/phase.c", "src/logdir.c",
+  "src/d3d9.def"
 )
+# The engine files every harness links, minus the renderer.
+$engine = @("src/savestate.c", "src/dsoundhook.c", "src/ds_sw.c", "src/xa2_sw.c", "src/gameheap.c", "src/phase.c", "src/logdir.c")
 
 New-Item -ItemType Directory -Force -Path "build" | Out-Null
 
 # The game is a 32-bit process, so this is the one that actually ships.
-& $zig cc @warn -Isrc -DD3D9SW_VARIANT=stock -target x86-windows-gnu -shared -o build\d3d9.dll @src -lgdi32 -luser32
+# A fixed base: a save records addresses inside this DLL, and a later launch
+# has to put it back at the same place for a save from that launch to load.
+& $zig cc @warn -Isrc -DD3D9SW_VARIANT=stock -target x86-windows-gnu -shared -o build\d3d9.dll @src -lgdi32 -luser32 -lwinmm "-Wl,--image-base=0x60000000" "-Wl,--no-dynamicbase"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "built build\d3d9.dll (PE32 - this is the file you drop next to the game)"
 
@@ -42,12 +48,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # invariant can be asserted after every restore instead of waiting to see
 # whether something dies later. Built from the same source the game loads: a
 # harness against a copy of the engine would prove nothing about the engine.
-& $zig cc @warn -Isrc -target x86_64-windows-gnu -o build\ss_harness.exe tests\ss_harness.c src\savestate.c -luser32
+& $zig cc @warn -Isrc -target x86-windows-gnu -o build\ss_harness.exe tests\ss_harness.c @engine -luser32 -lwinmm
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # A tiny D3D9 program that loads the wrapper and draws, so the DLL can be shown
 # to work without launching the game. 32-bit, to match it.
-& $zig cc @warn -Isrc -target x86-windows-gnu -o build\d3d9_sw_test.exe tests\test.c -luser32 -lgdi32
+& $zig cc @warn -Isrc -target x86-windows-gnu -o build\d3d9_sw_test.exe tests\test.c -luser32 -lgdi32 -lwinmm
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "built build\test_seam.exe build\ss_harness.exe build\d3d9_sw_test.exe"

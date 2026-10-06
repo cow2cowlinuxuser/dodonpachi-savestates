@@ -3,39 +3,61 @@
 Save states for **DoDonPachi Resurrection** on PC, via a drop-in replacement for
 `d3d9.dll` that renders the entire game on the CPU.
 
-One slot, saved and restored instantly from the keyboard, so you can drill a
+Four slots, saved and restored from the keyboard, so you can drill a
 boss pattern from the exact moment before it kills you instead of replaying the
 stage. There is no emulator involved — the retail Steam build runs normally, and
 the wrapper sits between it and Direct3D.
 
 ![DoDonPachi Resurrection running on the software renderer](docs/screenshot.jpg)
 
+## Where 2.0 stands
+
+- **Save states work.** Saving and loading while the game is running is
+  settled for this game: four slots, loaded as often as you like.
+- **No GPU needed.** The whole game is drawn on the CPU, so it runs on a
+  machine with no working Direct3D driver at all.
+- **Saves survive a restart, but don't rely on that yet.** A slot is written to
+  disk, and you can quit, relaunch and load it on the same machine. That works
+  and is stable in testing, but it is not dependable: treat a slot from an
+  earlier launch as a bonus, not a backup.
+- **Saves do not move between machines yet.** A slot carries addresses inside
+  Windows' own DLLs, and those change with every monthly Windows update. A slot
+  from a machine on a different update loads its music and nothing else. The
+  log says so before it tries (see [Logs](#logs)).
+- **A slot only loads into the same build of the DLL that wrote it.** Updating
+  the DLL retires your old slots.
+
 ## Controls
 
 | Key | Action |
 | --- | --- |
-| `F5` | Save state |
-| `Shift` + `F5` | Restore it |
+| `F5` - `F8` | Save to slot 1 - 4 |
+| `Shift` + `F5` - `F8` | Load that slot |
 | `Alt` + `Enter` | Toggle borderless fullscreen |
 | `F9` | Lossless screen capture, for reporting rendering bugs |
 
 Hotkeys only act while the game is the focused window, so they will not fire
 while you are in another application.
 
-There is currently **one** slot. The hotkey handler is written for `F5`
-onwards and will light up `F6`–`F8` the moment `SAVESTATE_SLOTS` in
-`src/savestate.h` is raised, but a snapshot holds a copy of the game's writable
-memory and the game is not small, so extra slots cost real RAM. It is set to
-one until somebody has measured what four actually costs.
+Each slot is a file in the game folder (`d3d9sw_slot0.*` to `d3d9sw_slot3.*`)
+holding the game's writable memory, roughly 250 - 850 MB depending on where
+you are in the game. Budget a few GB of disk for all four.
 
 ## Install
 
-1. Grab `d3d9.dll` from [Releases](../../releases), or build it yourself (below).
-2. Drop it next to `default.exe`, in
+1. Grab `d3d9.dll` and `d3d9_sw.cfg` from [Releases](../../releases), or
+   build the DLL yourself (below); the cfg is in this repo.
+2. Drop both next to `default.exe`, in
    `steamapps/common/DoDonPachi Resurrection/`.
-3. Launch the game as usual.
+3. Launch the game through Steam as usual.
 
-To uninstall, delete the file. Nothing else on your system is touched — no
+The cfg matters: it places the game's memory at fixed addresses so a slot can
+be loaded back. Without it the game still runs, but slots are far less likely
+to load.
+
+The wrapper writes into the game folder: the slot files, a texture cache
+(`d3d9sw_pack`) and a `logs` folder. To uninstall, delete `d3d9.dll`,
+`d3d9_sw.cfg` and those. Nothing else on your system is touched — no
 installer, no registry keys, no changes outside the game folder.
 
 ### If the game does not start
@@ -82,11 +104,13 @@ the rasteriser is multithreaded and uses SSE2/AVX2 where available.
 
 ## Known limitations
 
-- **Restores can fail rather than restore.** The engine refuses to load a state
-  it cannot prove is safe, so it fails closed instead of resuming into a corrupt
-  process. In practice this means an occasional restore that does nothing.
-- **Audio does not always follow a restore.** A track loaded at save time may
-  not resume correctly. Gameplay is unaffected.
+- **Loading a slot from an earlier launch can hang or crash.** It works on the
+  same machine in testing, but it is a much harder restore than one within a
+  launch and is not yet dependable. See [Where 2.0 stands](#where-20-stands).
+- **Slots do not load on another machine** unless it is on exactly the same
+  Windows update. Loading one from a different update plays the music and
+  draws nothing.
+- **A new DLL build cannot load old slots.** The log says "build differs".
 - **Changing the window size stalls the game briefly.** Resizing, maximizing or
   toggling fullscreen makes the game rebuild its device resources, one of which
   is a 4096x4096 texture, and that is not quick to reconvert on a CPU. The game
@@ -213,14 +237,35 @@ broken if those come back clean.
 
 `build\ss_harness.exe` drives the save state engine directly, with no game and
 no wrapper, asserting invariants after every restore rather than waiting to see
-whether something dies later.
+whether something dies later. **In 2.0 it has fallen behind the engine and
+fails** (`ss_harness 200 4 synth` crashes, `heap` mode reports a lost heap). The
+2.0 save states were verified in the game itself instead: saves and repeated
+loads within a launch, and a save in one launch loaded in the next.
+
+## Logs
+
+Every launch gets its own folder, `logs\<date>_<time>_default_<pid>\`, inside
+the game folder. Each log in it starts with the same header: the launch time,
+the game and wrapper builds, the Windows build and the machine name. When
+reporting a problem, zip that one folder.
+
+`savestate.txt` is the one to read after a load. For a slot made in another
+launch, it lists what the slot assumes and whether this launch matches:
+
+```
+expect: ntdll.dll build    saved stamp A3FDEA31 size 1BF000, here stamp 4945C4B4 size 1BF000 - NOT HANDLED
+expect: main stack top     saved 00540000, here 00F00000 - handled
+expect: 10 fact(s) the same, 2 different and handled, 0 different and NOT handled
+```
+
+Any "NOT HANDLED" line means the load is expected to fail.
 
 ## Diagnostics
 
-Set these as environment variables before launching. Steam caches the
-environment at startup, so restart Steam after changing one — the wrapper logs
-the values it actually resolved to `d3d9_sw.log`, which is the quickest way to
-tell whether a change took effect.
+Set these in `d3d9_sw.cfg` (one `NAME=value` per line) or as environment
+variables, which win. Steam caches the environment at startup, so restart Steam
+after changing a variable — `savestate.txt` logs the value each setting actually
+resolved to, which is the quickest way to tell whether a change took effect.
 
 | Variable | Effect |
 | --- | --- |

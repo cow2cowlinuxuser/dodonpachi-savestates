@@ -1,8 +1,12 @@
+/* The renderer's statics in sections of their own, which D3D9SW_MERGE's "self"
+ * takes with the renderer's memory; the rest of this DLL's data stays live. */
+#pragma clang section bss = ".swbss" data = ".swdata"
 #define CINTERFACE
 #define COBJMACROS
 #define INITGUID
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winioctl.h>
 #include <d3d9.h>
 #include <math.h>
 #include <stdio.h>
@@ -15,6 +19,7 @@
 #include "swrast.h"
 #include "vsinterp.h"
 #include "trace.h"
+#include "logdir.h"
 
 #define D3D9_SW_FB_W 640
 #define D3D9_SW_FB_H 480
@@ -22,7 +27,7 @@
 /* When armed by an F9 capture, every draw of the following frame is logged
  * here with its screen bounds, so an artefact at known coordinates can be
  * matched back to the draw that produced it. */
-static FILE *g_draw_log;
+static FILE *g_draw_log SS_PRESENT;
 static int g_draw_log_seq;
 
 /* Diagnostic snapshot of the last textured draw that targets the backbuffer,
@@ -32,6 +37,15 @@ static struct BbDraw {
 	int bilinear, addr_u, addr_v, samp_mag, samp_min;
 	float x[3], y[3], u[3], v[3];
 } g_bb_draw;
+
+/* This frame's pixel buffers: textures sampled onto the backbuffer (kind 0)
+ * and offscreen targets drawn into (kind 1). F9 writes them out, so a target
+ * the game draws into can be told from a different one the composite reads. */
+static struct {
+	const void *px;
+	int w, h, kind;
+} g_frame_px[16];
+static int g_frame_px_n;
 
 /* D3D9SW_CLIENT=WxH pins the window's client area, and therefore the
  * backbuffer, to an exact size. The game renders into a 1280x720 offscreen
@@ -279,7 +293,26 @@ typedef struct SwTexture {
 	int native_is_pixels;
 	SwPriv *priv;
 	SwSurface *level0;
+	/* D3D9SW_TEXPROBE */
+	unsigned tp_frame;
+	int tp_idx;
+	volatile LONG tp_armed;
+	uintptr_t tp_lo, tp_hi;
+	/* D3D9SW_TEXPACK: content at pk_off in the pack file, pk_buf while locked */
+	int pk;
+	volatile LONG pk_stale;
+	unsigned pk_gen, pk_used, pk_len;
+	unsigned long long pk_off;
+	unsigned char *pk_buf;
 } SwTexture;
+
+static void tp_draw(IDirect3DBaseTexture9 *tex);
+static void tp_frame_end(void);
+static void tp_disarm_all(void);
+static void pk_ready(SwTexture *t);
+static void pk_release(SwTexture *t);
+static void pk_after_load(void);
+static void pk_frame_end(void);
 
 typedef struct SwSurface {
 	IDirect3DSurface9 iface;
@@ -471,7 +504,7 @@ static void sw_log(const char *msg)
 		return;
 	_snprintf(line, sizeof(line), "[d3d9_sw] %s\n", msg);
 	OutputDebugStringA(line);
-	f = fopen("d3d9_sw.log", "a");
+	f = swlog_fopen("d3d9_sw.log", "a");
 	if (f) {
 		fputs(line, f);
 		fclose(f);
@@ -742,10 +775,34 @@ static ULONG WINAPI Dev_Release(IDirect3DDevice9 *this)
 	return (ULONG)n;
 }
 
+/* D3D9SW_LOSE_DEVICE=N: after any load the device reports
+ * itself lost, then not-reset after N polls, until the game calls Reset. */
+static volatile LONG g_lost;
+static volatile LONG g_lost_polls;
+static volatile LONG g_lost_presents;
+
+static void lost_log(const char *msg)
+{
+	FILE *f = swlog_fopen("d3d9_sw_lose.txt", "a");
+	if (f) {
+		fprintf(f, "%lu %s\n", GetTickCount(), msg);
+		fclose(f);
+	}
+}
+
 static HRESULT WINAPI Dev_TestCooperativeLevel(IDirect3DDevice9 *this)
 {
 	(void)this;
-	return D3D_OK;
+	if (!g_lost)
+		return D3D_OK;
+	if (InterlockedIncrement(&g_lost_polls) == 1)
+		lost_log("lose-device: game polled TestCooperativeLevel");
+	if (g_lost_polls <= g_lost) {
+		sw_trace("Dev.TestCooperativeLevel -> DEVICELOST");
+		return D3DERR_DEVICELOST;
+	}
+	sw_trace("Dev.TestCooperativeLevel -> DEVICENOTRESET");
+	return D3DERR_DEVICENOTRESET;
 }
 
 static UINT WINAPI Dev_GetAvailableTextureMem(IDirect3DDevice9 *this)
@@ -848,11 +905,20 @@ static UINT WINAPI Dev_GetNumberOfSwapChains(IDirect3DDevice9 *this)
 }
 
 static void fullscreen_set(SwDevice *d, int on);
+static int env_flag(const char *name, int dflt);
 
 static HRESULT WINAPI Dev_Reset(IDirect3DDevice9 *this, D3DPRESENT_PARAMETERS *pp)
 {
 	SwDevice *d = dev_from(this);
 	int w, h;
+	sw_trace("Dev.Reset");
+	if (g_lost) {
+		char msg[128];
+		_snprintf(msg, sizeof(msg), "lose-device: game called Reset after %ld poll(s), %ld failed present(s)",
+			  g_lost_polls, g_lost_presents);
+		lost_log(msg);
+		g_lost = 0;
+	}
 	if (!pp)
 		return D3DERR_INVALIDCALL;
 	d->pp = *pp;
@@ -884,6 +950,22 @@ static HRESULT WINAPI Dev_Reset(IDirect3DDevice9 *this, D3DPRESENT_PARAMETERS *p
 	 * display driver's blitter rather than this CPU, and on a panel that is a
 	 * whole multiple of the layout - 1280x720 into 2560x1440 - that scale is
 	 * exactly 2x, where nearest-neighbour loses nothing at all. */
+	/* Not every game needs this, and for some it is actively wrong.
+	 *
+	 * The pin exists because DDPR fixes its layout at device creation and
+	 * never revisits it, so a later resize leaves the two disagreeing.
+	 * Ikaruga does the opposite: it recomputes on reset and genuinely means
+	 * the new size, so pinning starves it - it draws in 1707x960 coordinates
+	 * into a 480x640 buffer and everything lands off the edge, which on a
+	 * centred menu is an entirely black screen.
+	 *
+	 * There is no way to tell the two apart from the reset alone; the
+	 * difference only shows up later, in how much of the buffer the game
+	 * actually writes. Until that is measured rather than assumed, this is a
+	 * switch: D3D9SW_PINLAYOUT=0 for games that mean what they ask for. */
+	if (!env_flag("D3D9SW_PINLAYOUT", 1)) {
+		d->layout_w = d->layout_h = 0;
+	}
 	if (d->layout_w > 0 && d->layout_h > 0 && (w != d->layout_w || h != d->layout_h)) {
 		char msg[128];
 		_snprintf(msg, sizeof(msg),
@@ -1086,7 +1168,7 @@ static void prof_frame(void)
 	static double prev_cpu;
 	double cpu_ms;
 	static int enabled = -1;
-	static FILE *f;
+	static FILE *f SS_PRESENT;
 	static LARGE_INTEGER prev, fq;
 	static unsigned frame;
 	LARGE_INTEGER now;
@@ -1111,7 +1193,7 @@ static void prof_frame(void)
 					   "present_ms,flushes,tris,"
 					   "binned,area_px,bbox_px,tw,th,"
 					   "m_tex,m_bilin,m_over,m_add,m_blendoth,m_atest,"
-					   "m_ztest,m_flat,m_linv\n");
+					   "m_ztest,m_flat,m_linv,guard_ms,audio_ms\n");
 			}
 			QueryPerformanceFrequency(&fq);
 			QueryPerformanceCounter(&prev);
@@ -1141,9 +1223,11 @@ static void prof_frame(void)
 		fprintf(f, "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.0f,%.0f,%d,%d", frame,
 			total_ms, raster_ms, total_ms - raster_ms, cpu_ms, g_present_ms,
 			flushes, tris, bins, area, bbox, tw, th);
+		double guard_ms, audio_ms;
 		for (i = 0; i < 9; i++)
 			fprintf(f, ",%.0f", mix[i]);
-		fprintf(f, "\n");
+		savestate_perf_take(&guard_ms, &audio_ms);
+		fprintf(f, ",%.3f,%.3f\n", guard_ms, audio_ms);
 	}
 	if ((frame & 63) == 0)
 		fflush(f);
@@ -1182,6 +1266,66 @@ static int env_flag(const char *name, int dflt);
  * releases and the oldest target here predates all of them; the per-monitor
  * paths simply will not be found on 7, which is fine, the last fallback has
  * existed since Vista. D3D9SW_DPI=0 opts out. */
+/* Per-game settings, from a d3d9_sw.ini beside the executable.
+ *
+ * Every knob here is an environment variable, which is fine until two games
+ * want opposite answers - DDPR needs the layout pinned and Ikaruga needs it
+ * left alone, and one Steam environment cannot say both. A file in the game's
+ * own folder is per-game by construction, which the environment is not.
+ *
+ * Loaded by promoting each line into the environment, so nothing downstream
+ * needs to know this exists. The environment still wins where both are set:
+ * whoever typed a variable meant it for this run, and a file that overrode
+ * that would be impossible to argue with. */
+static void load_ini_once(void)
+{
+	static volatile LONG once;
+	char path[MAX_PATH], line[256], probe[8];
+	DWORD n;
+	FILE *f;
+	char *p;
+
+	if (InterlockedExchange(&once, 1))
+		return;
+	n = GetModuleFileNameA(NULL, path, sizeof(path));
+	if (!n || n >= sizeof(path))
+		return;
+	p = strrchr(path, '\\');
+	if (!p || (size_t)(p - path) + sizeof("\\d3d9_sw.ini") >= sizeof(path))
+		return;
+	strcpy(p, "\\d3d9_sw.ini");
+	f = fopen(path, "r");
+	if (!f)
+		return;
+
+	while (fgets(line, sizeof(line), f)) {
+		char *eq, *key, *val, *e;
+		key = line;
+		while (*key == ' ' || *key == '\t')
+			key++;
+		if (*key == '#' || *key == ';' || *key == '[')
+			continue;
+		eq = strchr(key, '=');
+		if (!eq)
+			continue;
+		*eq = 0;
+		val = eq + 1;
+		for (e = eq - 1; e >= key && (*e == ' ' || *e == '\t'); e--)
+			*e = 0;
+		while (*val == ' ' || *val == '\t')
+			val++;
+		for (e = val + strlen(val) - 1; e >= val && (unsigned char)*e <= ' '; e--)
+			*e = 0;
+		if (!*key || strncmp(key, "D3D9SW_", 7) != 0)
+			continue;
+		if (GetEnvironmentVariableA(key, probe, sizeof(probe)) > 0)
+			continue; /* already set for this run; leave it alone */
+		SetEnvironmentVariableA(key, val);
+	}
+	fclose(f);
+	sw_log("read d3d9_sw.ini beside the game");
+}
+
 static BOOL CALLBACK dpi_count_windows(HWND hwnd, LPARAM lp)
 {
 	DWORD pid = 0;
@@ -1198,9 +1342,15 @@ static void dpi_awareness_once(void)
 	FARPROC p;
 	int existing = 0;
 
+	/* Three states rather than a flag, so env_flag is no use here:
+	 * 0 never claim, 1 claim only while it is still safe to, 2 claim anyway. */
+	char buf[8];
+	DWORD n = GetEnvironmentVariableA("D3D9SW_DPI", buf, sizeof(buf));
+	int mode = (n > 0 && n < sizeof(buf)) ? buf[0] - '0' : 1;
+
 	if (InterlockedExchange(&once, 1))
 		return;
-	if (!env_flag("D3D9SW_DPI", 1)) {
+	if (mode <= 0) {
 		sw_log("dpi: disabled by D3D9SW_DPI=0; a scaled display will resample the output");
 		return;
 	}
@@ -1214,13 +1364,27 @@ static void dpi_awareness_once(void)
 	 * this ever prints a non-zero, the sizing oddity that follows has a named
 	 * suspect instead of being blamed on a graphics driver. */
 	EnumWindows(dpi_count_windows, (LPARAM)&existing);
-	if (existing) {
-		char msg[128];
+	if (existing && mode < 2) {
+		/* Too late to be safe, so do not do it.
+		 *
+		 * Awareness is a promise about coordinates the process has
+		 * already been using. A window created while unaware was sized in
+		 * virtual units, and claiming awareness now redefines those units
+		 * underneath it without resizing anything - Ikaruga lands at
+		 * 1707x960, the virtual desktop size, on a 2560x1440 panel.
+		 *
+		 * Declining costs a compositor upscale on a scaled display, which
+		 * is soft but correct. Proceeding costs a window whose size means
+		 * something different to us than to the game that made it, and
+		 * that is the class of bug that gets blamed on a graphics driver.
+		 * D3D9SW_DPI=2 to insist anyway. */
+		char msg[160];
 		_snprintf(msg, sizeof(msg),
-			  "dpi: %d window(s) already exist; claiming awareness now is "
-			  "mixed-mode (D3D9SW_DPI=0 to skip)",
+			  "dpi: %d window(s) already exist, so not claiming awareness - the "
+			  "display may upscale the output (D3D9SW_DPI=2 to force)",
 			  existing);
 		sw_log(msg);
+		return;
 	}
 
 	u32 = GetModuleHandleA("user32.dll");
@@ -1469,6 +1633,72 @@ static int alt_enter_enabled(void)
 	return cached;
 }
 
+/* The device window this process created, out of the restore's reach. A load
+ * from another launch puts back a device whose window handles are that
+ * launch's: frames went on being drawn and every blit went to a window that no
+ * longer exists, while input and audio carried on. */
+static HWND g_live_window SS_PRESENT, g_live_focus SS_PRESENT;
+void gameheap_frame(void);
+void phase_snapshot(const char *phase);
+
+static int window_is_ours(HWND h)
+{
+	DWORD pid = 0;
+
+	return h && IsWindow(h) && GetWindowThreadProcessId(h, &pid) &&
+	       pid == GetCurrentProcessId();
+}
+
+static void dev_window_fix(SwDevice *d)
+{
+	/* Not just "a window of ours": the restore remaps saved handles to live
+	 * windows by class and Z order, which can hand the device a sibling. */
+	if (!g_live_window || !window_is_ours(g_live_window) ||
+	    (d->device_window == g_live_window && d->rast.hwnd == g_live_window))
+		return;
+	sw_trace("device window %p (rasterizer %p) is not the one this launch created, "
+		 "presenting to %p\n", (void *)d->device_window, (void *)d->rast.hwnd,
+		 (void *)g_live_window);
+	d->device_window = g_live_window;
+	d->rast.hwnd = g_live_window;
+	if (d->pp.hDeviceWindow)
+		d->pp.hDeviceWindow = g_live_window;
+	if (g_live_focus)
+		d->focus = g_live_focus;
+}
+
+static void rt_note(uint32_t *px, size_t n);
+static void rt_forget(const void *px);
+static void rt_blank_all(void);
+
+void gameheap_swa_sweep(void);
+
+/* Presents left before the DEFAULT-pool arena is swept: long enough after a
+ * load for the game to have released and remade what the reset asked for. */
+static LONG g_sweep_in SS_PRESENT;
+
+/* Once after a load. Returns 1 if the device is now reported lost. */
+static int after_load(SwDevice *d)
+{
+	LONG k;
+
+	if (!savestate_merged_clear())
+		return 0;
+	pk_after_load();
+	g_sweep_in = savestate_knob("D3D9SW_SWARENA_SWEEP", 180);
+	sw_trace_restart("frames after a load");
+	if (d->rast.color && d->rast.width > 0 && d->rast.height > 0)
+		memset(d->rast.color, 0, (size_t)d->rast.width * (size_t)d->rast.height * 4);
+	rt_blank_all();
+	k = savestate_knob("D3D9SW_LOSE_DEVICE", 0);
+	if (k <= 0)
+		return 0;
+	g_lost_polls = g_lost_presents = 0;
+	InterlockedExchange(&g_lost, k);
+	lost_log("lose-device: device reported lost from this frame");
+	return 1;
+}
+
 static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const RECT *dst,
 				  HWND hwnd_override, const RGNDATA *dirty)
 {
@@ -1478,10 +1708,34 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 	(void)src;
 	(void)dst;
 	(void)dirty;
+	dev_window_fix(d);
+	if (hwnd_override && g_live_window && hwnd_override != g_live_window &&
+	    !window_is_ours(hwnd_override))
+		hwnd_override = NULL;
 	swrast_flush();
 	prof_frame();
 	allocwatch_frame();
+	gameheap_frame();
+	tp_frame_end();
+	pk_frame_end();
 	savestate_guard();
+	if (savestate_saved_since())
+		sw_trace_restart("frames after a save");
+	after_load(d);
+	if (g_lost) {
+		LONG n = InterlockedIncrement(&g_lost_presents);
+		sw_trace("Dev.Present -> DEVICELOST");
+		if (n == 1 || n % 60 == 0) {
+			char msg[96];
+			_snprintf(msg, sizeof(msg), "lose-device: present %ld failed, %ld poll(s) so far", n, g_lost_polls);
+			lost_log(msg);
+		}
+		if (n == 600) {
+			lost_log("lose-device: 600 presents without a Reset - the game ignores it; device back");
+			g_lost = 0;
+		}
+		return D3DERR_DEVICELOST;
+	}
 	/* Alt+Enter, the convention every game of this era shipped with. Polled
 	 * here rather than by subclassing the window, for the same reason the
 	 * rewind keys are: nothing to install and nothing left behind to unhook
@@ -1497,13 +1751,22 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 	}
 	fullscreen_reassert(d);
 	/* Rewind hotkeys. Taken after the flush, so no draw is in flight and the
-	 * snapshot sees a quiescent renderer: F5..F8 save, shift+F5..F8 restore. */
+	 * snapshot sees a quiescent renderer. Which key is which is resolved by
+	 * savestate_hotkey, so this backend and the D3D11 one cannot disagree and
+	 * D3D9SW_LOAD_VK reaches both. It also gets this loop off
+	 * GetAsyncKeyState's low bit, which the game consumes first. */
 	{
-		int k;
-		for (k = 0; dev_has_focus(d) && k < SAVESTATE_SLOTS; k++) {
-			if (!(GetAsyncKeyState(VK_F5 + k) & 1))
+		int k, soak = savestate_soak_action();
+
+		for (k = 0; k < SAVESTATE_SLOTS; k++) {
+			int hk = dev_has_focus(d) ? savestate_hotkey(k) : SS_HOTKEY_NONE;
+
+			if (hk == SS_HOTKEY_NONE && k == 0 && soak != SS_SOAK_NOTHING)
+				hk = soak == SS_SOAK_LOAD ? SS_HOTKEY_LOAD : SS_HOTKEY_SAVE;
+			if (hk == SS_HOTKEY_NONE)
 				continue;
-			if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
+			tp_disarm_all();
+			if (hk == SS_HOTKEY_LOAD) {
 				if (savestate_load(k))
 					sw_trace("savestate: restored slot %d in %.1f ms\n", k,
 						 savestate_last_ms());
@@ -1521,6 +1784,17 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 			}
 		}
 	}
+	/* A thread a load put back inside the save resumes here, mid-present. The
+	 * game renders its next frame before it presents again, and that frame
+	 * already names device objects this launch does not have, so the loss has
+	 * to reach it from this present. */
+	if (after_load(d)) {
+		InterlockedIncrement(&g_lost_presents);
+		lost_log("lose-device: reported from the present the load resumed in");
+		return D3DERR_DEVICELOST;
+	}
+	if (g_sweep_in > 0 && --g_sweep_in == 0)
+		gameheap_swa_sweep();
 	rewind_clock_title(d->device_window);
 	/* F9 grabs the backbuffer losslessly; screenshots of seam artefacts are
 	 * useless once a JPEG encoder has been near them. */
@@ -1532,16 +1806,18 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 		if (dev_has_focus(d) && (GetAsyncKeyState(VK_F9) & 1)) {
 			swrast_drawid_arm();
 			if (!g_draw_log) {
-				g_draw_log = fopen("d3d9_sw_draws.txt", "w");
+				g_draw_log = swlog_fopen("d3d9_sw_draws.txt", "w");
 				g_draw_log_seq = 0;
 			}
 			pending = 1;
 		} else if (pending) {
 			static int snap;
-			char name[64];
-			_snprintf(name, sizeof(name), "d3d9_sw_snap%d.tga", ++snap);
+			char name[MAX_PATH], leaf[64];
+			_snprintf(leaf, sizeof(leaf), "d3d9_sw_snap%d.tga", ++snap);
+			swlog_path(leaf, name, sizeof(name));
 			swrast_dump_tga(&d->rast, name);
-			_snprintf(name, sizeof(name), "d3d9_sw_snap%d", snap);
+			_snprintf(leaf, sizeof(leaf), "d3d9_sw_snap%d", snap);
+			swlog_path(leaf, name, sizeof(name));
 			swrast_dump_drawid(name);
 			/* The source the composite quad samples. Comparing it against
 			 * the backbuffer separates seams the game rendered from seams
@@ -1552,13 +1828,14 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 				src.color = d->off_color;
 				src.width = d->off_w;
 				src.height = d->off_h;
-				_snprintf(name, sizeof(name), "d3d9_sw_snap%d_src.tga", snap);
+				_snprintf(leaf, sizeof(leaf), "d3d9_sw_snap%d_src.tga", snap);
+				swlog_path(leaf, name, sizeof(name));
 				swrast_dump_tga(&src, name);
 			}
 			if (g_bb_draw.valid) {
 				FILE *bf;
-				_snprintf(name, sizeof(name), "d3d9_sw_snap%d_bb.txt", snap);
-				bf = fopen(name, "w");
+				_snprintf(leaf, sizeof(leaf), "d3d9_sw_snap%d_bb.txt", snap);
+				bf = swlog_fopen(leaf, "w");
 				if (bf) {
 					int k;
 					fprintf(bf, "tris=%d tex=%dx%d rt=%dx%d\n", g_bb_draw.tri_count,
@@ -1570,8 +1847,16 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 					for (k = 0; k < 3; k++)
 						fprintf(bf, "v%d xy=(%.4f,%.4f) uv=(%.6f,%.6f) texel=(%.3f,%.3f)\n",
 							k, g_bb_draw.x[k], g_bb_draw.y[k], g_bb_draw.u[k],
-							g_bb_draw.v[k], g_bb_draw.u[k] * g_bb_draw.tex_w,
+							g_bb_draw.							v[k], g_bb_draw.u[k] * g_bb_draw.tex_w,
 							g_bb_draw.v[k] * g_bb_draw.tex_h);
+					fprintf(bf, "off_color=%p %dx%d  rt0=%p  bb=%p  last_load_foreign=%d\n",
+						(void *)d->off_color, d->off_w, d->off_h, (void *)d->rt0,
+						(void *)d->rast.color, savestate_last_load_foreign());
+					for (k = 0; k < g_frame_px_n; k++)
+						fprintf(bf, "%s %p %dx%d restored=%d\n",
+							g_frame_px[k].kind ? "drawn-into" : "sampled-to-bb",
+							g_frame_px[k].px, g_frame_px[k].w, g_frame_px[k].h,
+							savestate_addr_restored(g_frame_px[k].px));
 					fclose(bf);
 				}
 			}
@@ -1602,6 +1887,7 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 		d->drew_off = 0;
 		d->drew_bb = 0;
 		d->off_used_valid = 0;
+		g_frame_px_n = 0;
 		/* Draw indices are only meaningful within a frame. */
 		swrast_drawid_newframe();
 		p = InterlockedIncrement(&presents);
@@ -1618,7 +1904,7 @@ static HRESULT WINAPI Dev_Present(IDirect3DDevice9 *this, const RECT *src, const
 			else if (d->rast.color)
 				hsh = hash_rect(d->rast.color, d->rast.width, d->rast.height,
 						d->rast.width, d->rast.height);
-			cf = fopen("d3d9_sw_present.txt", "w");
+			cf = swlog_fopen("d3d9_sw_present.txt", "w");
 			if (cf) {
 				fprintf(cf,
 					"%ld calls=%u dips=%u rej=%u/%u prims=%u clr=%u vsok=%u vsfail=%u hash=%08x tri=%.2f,%.2f uv=%.3f,%.3f c0=%.4f,%.4f,%.4f,%.4f\n",
@@ -2379,7 +2665,7 @@ static void dump_tex_once(SwTexture *t, const char *path)
 	UINT key;
 	int i;
 	(void)path;
-	if (!t || !t->pixels)
+	if (!t || t->pk || !t->pixels)
 		return;
 	if (t->usage & D3DUSAGE_RENDERTARGET)
 		return;
@@ -2823,6 +3109,7 @@ static HRESULT raster_tri_bytes(SwDevice *d, D3DPRIMITIVETYPE type, UINT prims,
 	int vs_clip = 0;
 
 	d->frame_draw_calls++;
+	tp_draw(d->tex0);
 	if (!vb || prims == 0) {
 		d->frame_rejects++;
 		d->frame_reject_code = 1;
@@ -2875,6 +3162,7 @@ static HRESULT raster_tri_bytes(SwDevice *d, D3DPRIMITIVETYPE type, UINT prims,
 	}
 	if (d->tex0) {
 		SwTexture *stex = (SwTexture *)d->tex0;
+		pk_ready(stex);
 		st.width = stex->w;
 		st.height = stex->h;
 		st.pixels = stex->pixels;
@@ -3132,6 +3420,24 @@ static HRESULT raster_tri_bytes(SwDevice *d, D3DPRIMITIVETYPE type, UINT prims,
 		g_bb_draw.u[0] = batch[0].a.u; g_bb_draw.v[0] = batch[0].a.v;
 		g_bb_draw.u[1] = batch[0].b.u; g_bb_draw.v[1] = batch[0].b.v;
 		g_bb_draw.u[2] = batch[0].c.u; g_bb_draw.v[2] = batch[0].c.v;
+	}
+	if (total > 0) {
+		const void *px = rt.color == d->rast.color ? (tex ? (const void *)tex->pixels : NULL)
+							    : (const void *)rt.color;
+		int k, w = rt.color == d->rast.color ? (tex ? tex->width : 0) : rt.width;
+		int h = rt.color == d->rast.color ? (tex ? tex->height : 0) : rt.height;
+		int kind = rt.color == d->rast.color ? 0 : 1;
+
+		for (k = 0; k < g_frame_px_n; k++)
+			if (g_frame_px[k].px == px && g_frame_px[k].kind == kind)
+				break;
+		if (k == g_frame_px_n && px && k < (int)(sizeof(g_frame_px) / sizeof(g_frame_px[0]))) {
+			g_frame_px[k].px = px;
+			g_frame_px[k].w = w;
+			g_frame_px[k].h = h;
+			g_frame_px[k].kind = kind;
+			g_frame_px_n++;
+		}
 	}
 	{
 		static LONG once;
@@ -3457,16 +3763,362 @@ static ULONG WINAPI Tex_AddRef(IDirect3DTexture9 *this)
 	return (ULONG)InterlockedIncrement(&tex_from(this)->ref);
 }
 
+/* free() for a block a load may have brought back by pointer only: an object
+ * restored from another launch can name a buffer that launch allocated outside
+ * every region the load took. Freeing that reads a heap header from unmapped
+ * memory, so it is leaked instead. */
+static void free_live(void *p)
+{
+	static volatile LONG leaked;
+	MEMORY_BASIC_INFORMATION mbi;
+	uintptr_t a = (uintptr_t)p;
+
+	if (!p)
+		return;
+	if (VirtualQuery((void *)(a - 16), &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT &&
+	    VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT) {
+		free(p);
+		return;
+	}
+	if (InterlockedIncrement(&leaked) <= 16) {
+		char msg[96];
+		_snprintf(msg, sizeof(msg), "release: %p is not mapped here - left alone", p);
+		lost_log(msg);
+	}
+}
+
+/* ---- D3D9SW_TEXPROBE=1: can texture memory move, and how much is drawn? ----
+ *
+ * Two things a texture pack behind a mapped window needs to know first. Does the
+ * game touch texture memory outside LockRect/UnlockRect - a raw pointer it kept -
+ * or only through us? And how many megabytes of textures does a frame, a second
+ * and ten seconds of play draw?
+ *
+ * Unlock guards the whole pages of the buffer the game wrote; Lock clears them.
+ * A guard fault from this DLL is our rasterizer reading it, which is the control
+ * and must not stay at zero; from anywhere else it is a raw pointer. An entry is
+ * disarmed whole at its first fault, so one arm costs at most one exception. */
+#define TP_LIVE 8192
+#define TP_SITES 64
+#define TP_MIN (64u * 1024u)
+
+static int g_tp_on = -1;
+static SwTexture *g_tp_live[TP_LIVE];
+static volatile LONG g_tp_n, g_tp_lock;
+static unsigned g_tp_frame = 1;
+static unsigned long long g_tp_fbytes, g_tp_max_frame, g_tp_max_1s, g_tp_max_10s;
+static unsigned long long g_tp_all_frame, g_tp_all_1s, g_tp_all_10s;
+static unsigned g_tp_fn, g_tp_max_fn;
+static volatile LONG g_tp_arms, g_tp_raster, g_tp_other, g_tp_nsite;
+static uintptr_t g_tp_self_lo, g_tp_self_hi;
+static struct {
+	uintptr_t eip, ret;
+	volatile LONG n;
+	int w, h;
+	D3DFORMAT fmt;
+	D3DPOOL pool;
+} g_tp_site[TP_SITES];
+
+static void tp_lock(void)
+{
+	while (InterlockedCompareExchange(&g_tp_lock, 1, 0))
+		Sleep(0);
+}
+
+static void tp_unlock(void)
+{
+	InterlockedExchange(&g_tp_lock, 0);
+}
+
+static unsigned long long tp_bytes(const SwTexture *t)
+{
+	unsigned long long n = (unsigned long long)t->w * (unsigned long long)t->h * 4u;
+
+	if (t->native && !t->native_is_pixels)
+		n += t->native_size;
+	return n;
+}
+
+static LONG CALLBACK tp_veh(EXCEPTION_POINTERS *ep)
+{
+	const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+	uintptr_t a, eip;
+	SwTexture *t = NULL;
+	DWORD old;
+	LONG i, n;
+
+	if (er->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || er->NumberParameters < 2)
+		return EXCEPTION_CONTINUE_SEARCH;
+	a = (uintptr_t)er->ExceptionInformation[1];
+	n = g_tp_n;
+	for (i = 0; i < n && i < TP_LIVE; i++) {
+		SwTexture *c = g_tp_live[i];
+
+		if (c && a >= c->tp_lo && a < c->tp_hi) {
+			t = c;
+			break;
+		}
+	}
+	if (!t)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (!InterlockedExchange(&t->tp_armed, 0))
+		return EXCEPTION_CONTINUE_EXECUTION;
+	VirtualProtect((void *)t->tp_lo, t->tp_hi - t->tp_lo, PAGE_READWRITE, &old);
+	eip = (uintptr_t)ep->ContextRecord->Eip;
+	if (eip >= g_tp_self_lo && eip < g_tp_self_hi) {
+		InterlockedIncrement(&g_tp_raster);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	InterlockedIncrement(&g_tp_other);
+	for (i = 0; i < g_tp_nsite && i < TP_SITES; i++)
+		if (g_tp_site[i].eip == eip) {
+			InterlockedIncrement(&g_tp_site[i].n);
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	i = InterlockedIncrement(&g_tp_nsite) - 1;
+	if (i < TP_SITES) {
+		g_tp_site[i].eip = eip;
+		g_tp_site[i].ret = *(const uintptr_t *)(uintptr_t)ep->ContextRecord->Esp;
+		g_tp_site[i].w = t->w;
+		g_tp_site[i].h = t->h;
+		g_tp_site[i].fmt = t->fmt;
+		g_tp_site[i].pool = t->pool;
+		g_tp_site[i].n = 1;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static int tp_on(void)
+{
+	if (g_tp_on < 0) {
+		HMODULE self = NULL;
+
+		g_tp_on = savestate_knob("D3D9SW_TEXPROBE", 0) > 0;
+		if (g_tp_on && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+							  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+						  (LPCSTR)(void *)tp_veh, &self)) {
+			const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)self;
+			const IMAGE_NT_HEADERS *nt =
+				(const IMAGE_NT_HEADERS *)((const char *)self + dos->e_lfanew);
+
+			g_tp_self_lo = (uintptr_t)self;
+			g_tp_self_hi = g_tp_self_lo + nt->OptionalHeader.SizeOfImage;
+			AddVectoredExceptionHandler(1, tp_veh);
+		}
+	}
+	return g_tp_on;
+}
+
+static void tp_add(SwTexture *t)
+{
+	if (!tp_on())
+		return;
+	tp_lock();
+	if (g_tp_n < TP_LIVE) {
+		g_tp_live[g_tp_n] = t;
+		t->tp_idx = g_tp_n + 1;
+		InterlockedIncrement(&g_tp_n);
+	}
+	tp_unlock();
+}
+
+static void tp_disarm(SwTexture *t)
+{
+	DWORD old;
+
+	if (InterlockedExchange(&t->tp_armed, 0))
+		VirtualProtect((void *)t->tp_lo, t->tp_hi - t->tp_lo, PAGE_READWRITE, &old);
+}
+
+static void tp_remove(SwTexture *t)
+{
+	LONG i;
+
+	if (g_tp_on <= 0)
+		return;
+	tp_disarm(t);
+	tp_lock();
+	i = t->tp_idx - 1;
+	if (i >= 0 && i < g_tp_n && g_tp_live[i] == t) {
+		SwTexture *last = g_tp_live[g_tp_n - 1];
+
+		g_tp_live[i] = last;
+		last->tp_idx = i + 1;
+		g_tp_live[g_tp_n - 1] = NULL;
+		InterlockedDecrement(&g_tp_n);
+	}
+	t->tp_idx = 0;
+	tp_unlock();
+}
+
+/* Last thing in Unlock, after our own conversion has read the buffer. */
+static void tp_arm(SwTexture *t)
+{
+	unsigned char *buf;
+	size_t size;
+	uintptr_t lo, hi;
+	DWORD old;
+
+	if (g_tp_on <= 0 || !t->tp_idx || t->pk)
+		return;
+	if (t->native && !t->native_is_pixels) {
+		buf = t->native;
+		size = t->native_size;
+	} else {
+		buf = (unsigned char *)t->pixels;
+		size = (size_t)t->w * (size_t)t->h * 4u;
+	}
+	if (!buf)
+		return;
+	lo = ((uintptr_t)buf + 0xFFFu) & ~(uintptr_t)0xFFFu;
+	hi = ((uintptr_t)buf + size) & ~(uintptr_t)0xFFFu;
+	if (hi <= lo || hi - lo < TP_MIN)
+		return;
+	tp_disarm(t);
+	t->tp_lo = lo;
+	t->tp_hi = hi;
+	if (VirtualProtect((void *)lo, hi - lo, PAGE_READWRITE | PAGE_GUARD, &old)) {
+		InterlockedExchange(&t->tp_armed, 1);
+		InterlockedIncrement(&g_tp_arms);
+	}
+}
+
+/* Before a save or a load: a guarded page must not be what the snapshot reads. */
+static void tp_disarm_all(void)
+{
+	LONG i;
+
+	if (g_tp_on <= 0)
+		return;
+	tp_lock();
+	for (i = 0; i < g_tp_n; i++)
+		if (g_tp_live[i])
+			tp_disarm(g_tp_live[i]);
+	tp_unlock();
+}
+
+static void tp_draw(IDirect3DBaseTexture9 *tex)
+{
+	SwTexture *t = (SwTexture *)tex;
+
+	if (g_tp_on <= 0 || !t || t->iface.lpVtbl != &kTexVtbl || t->tp_frame == g_tp_frame)
+		return;
+	t->tp_frame = g_tp_frame;
+	g_tp_fbytes += tp_bytes(t);
+	g_tp_fn++;
+}
+
+static const char *tp_mod(uintptr_t a, uintptr_t *off)
+{
+	static char name[8][MAX_PATH];
+	static int k;
+	HMODULE m = NULL;
+	char *s, *slash;
+
+	*off = a;
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			       (LPCSTR)a, &m))
+		return "?";
+	s = name[k++ & 7];
+	if (!GetModuleFileNameA(m, s, MAX_PATH))
+		return "?";
+	slash = strrchr(s, '\\');
+	*off = a - (uintptr_t)m;
+	return slash ? slash + 1 : s;
+}
+
+static void tp_frame_end(void)
+{
+	static LONG reported;
+	unsigned long long by_pool[3] = { 0, 0, 0 }, w1 = 0, w10 = 0;
+	FILE *f;
+	LONG i, ns;
+
+	if (g_tp_on <= 0)
+		return;
+	if (g_tp_fbytes > g_tp_max_frame) {
+		g_tp_max_frame = g_tp_fbytes;
+		g_tp_max_fn = g_tp_fn;
+	}
+	g_tp_fbytes = 0;
+	g_tp_fn = 0;
+	g_tp_frame++;
+	if (g_tp_frame % 60)
+		return;
+	tp_lock();
+	for (i = 0; i < g_tp_n; i++) {
+		const SwTexture *t = g_tp_live[i];
+		unsigned long long b;
+
+		if (!t)
+			continue;
+		b = tp_bytes(t);
+		by_pool[t->pool == D3DPOOL_MANAGED ? 0 : t->pool == D3DPOOL_DEFAULT ? 1 : 2] += b;
+		if (t->tp_frame && g_tp_frame - t->tp_frame <= 60)
+			w1 += b;
+		if (t->tp_frame && g_tp_frame - t->tp_frame <= 600)
+			w10 += b;
+	}
+	tp_unlock();
+	if (w1 > g_tp_max_1s)
+		g_tp_max_1s = w1;
+	if (w10 > g_tp_max_10s)
+		g_tp_max_10s = w10;
+	if (g_tp_frame % 600)
+		return;
+	if (g_tp_max_frame > g_tp_all_frame)
+		g_tp_all_frame = g_tp_max_frame;
+	if (g_tp_max_1s > g_tp_all_1s)
+		g_tp_all_1s = g_tp_max_1s;
+	if (g_tp_max_10s > g_tp_all_10s)
+		g_tp_all_10s = g_tp_max_10s;
+	f = swlog_fopen("d3d9_sw_texprobe.txt", "a");
+	if (!f)
+		return;
+	fprintf(f,
+		"frame %u: %ld texture(s) live - %llu MB managed, %llu MB default, %llu MB other | "
+		"drawn, last 10 s: frame max %llu MB (%u texture(s)), 1 s max %llu MB, 10 s max "
+		"%llu MB | session max: frame %llu MB, 1 s %llu MB, 10 s %llu MB | guard: %ld "
+		"arm(s), %ld read by our rasterizer, %ld by someone else\n",
+		g_tp_frame, (long)g_tp_n, by_pool[0] >> 20, by_pool[1] >> 20, by_pool[2] >> 20,
+		g_tp_max_frame >> 20, g_tp_max_fn, g_tp_max_1s >> 20, g_tp_max_10s >> 20,
+		g_tp_all_frame >> 20, g_tp_all_1s >> 20, g_tp_all_10s >> 20, (long)g_tp_arms,
+		(long)g_tp_raster, (long)g_tp_other);
+	ns = g_tp_nsite < TP_SITES ? g_tp_nsite : TP_SITES;
+	for (i = reported; i < ns; i++) {
+		uintptr_t o1, o2;
+		const char *m1 = tp_mod(g_tp_site[i].eip, &o1);
+		const char *m2 = tp_mod(g_tp_site[i].ret, &o2);
+
+		fprintf(f,
+			"  RAW POINTER: %s+%lX (return address on the stack %s+%lX) touched a %dx%d "
+			"fmt %08x pool %u texture while it was unlocked\n",
+			m1, (unsigned long)o1, m2, (unsigned long)o2, g_tp_site[i].w, g_tp_site[i].h,
+			(unsigned)g_tp_site[i].fmt, (unsigned)g_tp_site[i].pool);
+	}
+	reported = ns;
+	fclose(f);
+	g_tp_max_frame = g_tp_max_1s = g_tp_max_10s = 0;
+	g_tp_max_fn = 0;
+}
+
 static ULONG WINAPI Tex_Release(IDirect3DTexture9 *this)
 {
 	SwTexture *t = tex_from(this);
 	LONG n = InterlockedDecrement(&t->ref);
 	if (n == 0) {
+		tp_remove(t);
+		rt_forget(t->pixels);
 		priv_free_all(t->priv);
-		if (t->native && !t->native_is_pixels)
-			free(t->native);
-		free(t->pixels);
-		free(t);
+		if (t->pk) {
+			pk_release(t);
+		} else {
+			if (t->native && !t->native_is_pixels)
+				free_live(t->native);
+			free_live(t->pixels);
+		}
+		free_live(t);
 	}
 	return (ULONG)n;
 }
@@ -3782,6 +4434,527 @@ static void tex_native_to_argb(SwTexture *t)
 	}
 }
 
+/* ---- D3D9SW_TEXPACK=dir: managed textures out of the 2 GB -------------------
+ *
+ * A managed texture's content - its bytes as the game wrote them - lives in
+ * dir\texpack.bin, append-only, one copy of each distinct content. The offset
+ * means the same thing in every slot and every launch, and it is what the
+ * texture object, which is saved, names. What the rasterizer reads is a
+ * converted copy in a cache in the range gameheap reserved at
+ * D3D9SW_TEXPACK_BASE: held out of every save, emptied by every load, and
+ * painted again from the file by the next draw that needs it. Lock hands out a
+ * buffer filled from the file; Unlock stores it and frees it.
+ *
+ * Measured with D3D9SW_TEXPROBE before this was built: DDPR touches texture
+ * memory only between Lock and Unlock. A game that kept a raw pointer would
+ * read freed memory here. */
+#define PK_GRAN (64u * 1024u)
+#define PK_SLOTS 65536u
+#define PK_HEAD (2u << 20)
+#define PK_MIN (64u * 1024u)
+#define PK_FILE (16ull << 30)
+#define PK_MAGIC 0x31585450u
+
+typedef struct {
+	unsigned long long h, off;
+	unsigned len, magic;
+} PkRec;
+
+uintptr_t gameheap_texpack_region(size_t *size);
+
+static struct {
+	int state;
+	uintptr_t base, cache;
+	size_t size;
+	unsigned ngran, gen, frame;
+	PkRec *tab;
+	SwTexture **owner;
+	HANDLE file, sec, idx;
+	unsigned long long end, live, paint_bytes, fsize;
+	unsigned nblob, stores, hits, paints, evicts, misses, ioerr, loads, lost;
+} g_pk SS_PRESENT;
+
+/* Rewinds with the threads, so a load never leaves it held by a thread that is
+ * no longer inside. */
+static volatile LONG g_pk_lock;
+
+static void pk_take(void)
+{
+	while (InterlockedCompareExchange(&g_pk_lock, 1, 0))
+		Sleep(0);
+}
+
+static void pk_give(void)
+{
+	InterlockedExchange(&g_pk_lock, 0);
+}
+
+static unsigned pk_newgen(void)
+{
+	LARGE_INTEGER q;
+	unsigned g;
+
+	QueryPerformanceCounter(&q);
+	g = ((unsigned)q.QuadPart ^ (unsigned)(q.QuadPart >> 32)) | 1u;
+	return g == g_pk.gen ? g + 2u : g;
+}
+
+static int pk_io(int write, unsigned long long off, void *buf, size_t n)
+{
+	unsigned char *p = (unsigned char *)buf;
+
+	while (n) {
+		OVERLAPPED o;
+		DWORD part = n > (16u << 20) ? (16u << 20) : (DWORD)n, got = 0;
+		BOOL ok;
+
+		memset(&o, 0, sizeof(o));
+		o.Offset = (DWORD)off;
+		o.OffsetHigh = (DWORD)(off >> 32);
+		ok = write ? WriteFile(g_pk.file, p, part, &got, &o)
+			   : ReadFile(g_pk.file, p, part, &got, &o);
+		if (!ok || got != part)
+			return 0;
+		p += part;
+		off += part;
+		n -= part;
+	}
+	return 1;
+}
+
+static void pk_insert(const PkRec *r)
+{
+	unsigned i = (unsigned)r->h & (PK_SLOTS - 1);
+
+	while (g_pk.tab[i].magic)
+		i = (i + 1) & (PK_SLOTS - 1);
+	g_pk.tab[i] = *r;
+	g_pk.nblob++;
+	if (r->off + r->len > g_pk.end)
+		g_pk.end = (r->off + r->len + 4095u) & ~4095ull;
+	savestate_note_texpack(g_pk.nblob, g_pk.end);
+}
+
+/* First managed texture: open the pack, read its index, claim the cache. */
+static int pk_on(void)
+{
+	char dir[MAX_PATH], path[MAX_PATH + 32], msg[MAX_PATH + 160];
+	PkRec r;
+	DWORD got;
+	LONG keep = 0;
+
+	if (g_pk.state)
+		return g_pk.state > 0;
+	pk_take();
+	if (g_pk.state) {
+		pk_give();
+		return g_pk.state > 0;
+	}
+	g_pk.state = -1;
+	if (!savestate_getenv("D3D9SW_TEXPACK", path, sizeof(path)) || strlen(path) >= MAX_PATH) {
+		pk_give();
+		return 0;
+	}
+	/* A relative pack sits in the game's folder, so copying the folder with its
+	 * slots carries the textures the slots name. */
+	if (path[0] != '\\' && !strchr(path, ':')) {
+		char *slash;
+		DWORD n = GetModuleFileNameA(NULL, dir, sizeof(dir));
+
+		slash = n && n < sizeof(dir) ? strrchr(dir, '\\') : NULL;
+		if (!slash || (size_t)(slash + 1 - dir) + strlen(path) >= sizeof(dir)) {
+			pk_give();
+			return 0;
+		}
+		strcpy(slash + 1, path);
+	} else {
+		strcpy(dir, path);
+	}
+	g_pk.base = gameheap_texpack_region(&g_pk.size);
+	if (!g_pk.base || g_pk.size < PK_HEAD + 16u * PK_GRAN ||
+	    !VirtualAlloc((void *)g_pk.base, PK_HEAD, MEM_COMMIT, PAGE_READWRITE)) {
+		sw_log("texpack: no cache range (D3D9SW_TEXPACK_BASE) - managed textures stay in "
+		       "the big-block span");
+		pk_give();
+		return 0;
+	}
+	CreateDirectoryA(dir, NULL);
+	_snprintf(path, sizeof(path), "%s\\texpack.bin", dir);
+	g_pk.file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+				OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	/* The file stays as long as what it holds, so a plain copy moves it. The view
+	 * covers what was there at open; content stored later reads through pk_io.
+	 * An empty pack has no view at all. */
+	if (g_pk.file != INVALID_HANDLE_VALUE)
+		g_pk.sec = CreateFileMappingA(g_pk.file, NULL, PAGE_READONLY, 0, 0, NULL);
+	_snprintf(path, sizeof(path), "%s\\texpack.idx", dir);
+	g_pk.idx = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+			       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (g_pk.file == INVALID_HANDLE_VALUE || g_pk.idx == INVALID_HANDLE_VALUE) {
+		_snprintf(msg, sizeof(msg), "texpack: could not open the pack in %s (error %lu) - off",
+			  dir, GetLastError());
+		sw_log(msg);
+		pk_give();
+		return 0;
+	}
+	g_pk.tab = (PkRec *)g_pk.base;
+	g_pk.owner = (SwTexture **)(g_pk.base + PK_SLOTS * sizeof(PkRec));
+	g_pk.cache = g_pk.base + PK_HEAD;
+	g_pk.ngran = (unsigned)((g_pk.size - PK_HEAD) / PK_GRAN);
+	if (g_pk.ngran > (PK_HEAD - PK_SLOTS * sizeof(PkRec)) / sizeof(SwTexture *))
+		g_pk.ngran = (PK_HEAD - PK_SLOTS * sizeof(PkRec)) / sizeof(SwTexture *);
+	g_pk.end = PK_GRAN;
+	{
+		LARGE_INTEGER sz;
+
+		g_pk.fsize = GetFileSizeEx(g_pk.file, &sz) ? (unsigned long long)sz.QuadPart : 0;
+	}
+	while (ReadFile(g_pk.idx, &r, sizeof(r), &got, NULL) && got == sizeof(r) &&
+	       r.magic == PK_MAGIC && r.off >= PK_GRAN && r.off + r.len <= g_pk.fsize &&
+	       g_pk.nblob < PK_SLOTS / 2) {
+		pk_insert(&r);
+		keep += sizeof(r);
+	}
+	/* A record cut short by a crash goes; appends start after the last whole one. */
+	SetFilePointer(g_pk.idx, keep, NULL, FILE_BEGIN);
+	SetEndOfFile(g_pk.idx);
+	savestate_exclude((void *)g_pk.base, g_pk.size);
+	g_pk.gen = pk_newgen();
+	g_pk.state = 1;
+	_snprintf(msg, sizeof(msg),
+		  "texpack: %s, %u stored content(s), %llu MB; cache %u MB at %08lX",
+		  dir, g_pk.nblob, g_pk.end >> 20, (unsigned)((g_pk.size - PK_HEAD) >> 20),
+		  (unsigned long)g_pk.cache);
+	sw_log(msg);
+	pk_give();
+	return 1;
+}
+
+static unsigned long long pk_hash(const unsigned char *p, size_t n)
+{
+	const uint32_t *q = (const uint32_t *)p;
+	unsigned long long h = 0xcbf29ce484222325ull ^ n;
+	size_t i;
+
+	for (i = 0; i < n / 4; i++)
+		h = (h ^ q[i]) * 0x100000001b3ull;
+	for (i = n & ~(size_t)3; i < n; i++)
+		h = (h ^ p[i]) * 0x100000001b3ull;
+	return h ^ (h >> 29);
+}
+
+/* Under the lock: the compare buffer is shared. */
+static int pk_same(unsigned long long off, const unsigned char *buf, size_t n)
+{
+	static unsigned char cmp[64 * 1024];
+
+	while (n) {
+		size_t part = n > sizeof(cmp) ? sizeof(cmp) : n;
+
+		if (!pk_io(0, off, cmp, part) || memcmp(cmp, buf, part))
+			return 0;
+		off += part;
+		buf += part;
+		n -= part;
+	}
+	return 1;
+}
+
+static int pk_store(const unsigned char *buf, unsigned n, unsigned long long *off)
+{
+	unsigned long long h = pk_hash(buf, n);
+	unsigned i = (unsigned)h & (PK_SLOTS - 1);
+	PkRec r;
+	DWORD got;
+
+	pk_take();
+	for (; g_pk.tab[i].magic; i = (i + 1) & (PK_SLOTS - 1))
+		if (g_pk.tab[i].h == h && g_pk.tab[i].len == n && pk_same(g_pk.tab[i].off, buf, n)) {
+			*off = g_pk.tab[i].off;
+			g_pk.hits++;
+			pk_give();
+			return 1;
+		}
+	if (g_pk.nblob >= PK_SLOTS / 2 || g_pk.end + n > PK_FILE || !pk_io(1, g_pk.end, (void *)buf, n)) {
+		g_pk.ioerr++;
+		pk_give();
+		return 0;
+	}
+	r.h = h;
+	r.off = g_pk.end;
+	r.len = n;
+	r.magic = PK_MAGIC;
+	WriteFile(g_pk.idx, &r, sizeof(r), &got, NULL);
+	pk_insert(&r);
+	g_pk.stores++;
+	*off = r.off;
+	pk_give();
+	return 1;
+}
+
+static int pk_owned(const SwTexture *t)
+{
+	uintptr_t a = (uintptr_t)t->pixels;
+
+	return g_pk.state > 0 && t->pk_gen == g_pk.gen && a >= g_pk.cache &&
+	       a < g_pk.cache + (uintptr_t)g_pk.ngran * PK_GRAN &&
+	       g_pk.owner[(a - g_pk.cache) / PK_GRAN] == t;
+}
+
+static unsigned pk_grans(const SwTexture *t)
+{
+	return (unsigned)(((size_t)t->w * (size_t)t->h * 4u + PK_GRAN - 1) / PK_GRAN);
+}
+
+/* Under the lock, for a texture pk_owned says holds a block. */
+static void pk_free(SwTexture *t)
+{
+	unsigned s = (unsigned)(((uintptr_t)t->pixels - g_pk.cache) / PK_GRAN), n = pk_grans(t), j;
+
+	swrast_flush_if_pending(t->pixels);
+	for (j = s; j < s + n && j < g_pk.ngran; j++)
+		if (g_pk.owner[j] == t)
+			g_pk.owner[j] = NULL;
+	g_pk.live -= (unsigned long long)n * PK_GRAN;
+	t->pixels = NULL;
+}
+
+/* The least recently drawn block that this frame has not drawn. */
+static int pk_evict_one(void)
+{
+	SwTexture *v = NULL;
+	unsigned i;
+
+	for (i = 0; i < g_pk.ngran; i++) {
+		SwTexture *o = g_pk.owner[i];
+
+		if (!o || (i && g_pk.owner[i - 1] == o) || o->pk_used == g_pk.frame)
+			continue;
+		if (!v || (int)(o->pk_used - v->pk_used) < 0)
+			v = o;
+	}
+	if (!v)
+		return 0;
+	pk_free(v);
+	g_pk.evicts++;
+	return 1;
+}
+
+static uint32_t *pk_alloc(SwTexture *t)
+{
+	unsigned need = pk_grans(t), i, run, j;
+
+	for (;;) {
+		for (i = 0, run = 0; i < g_pk.ngran; i++) {
+			run = g_pk.owner[i] ? 0 : run + 1;
+			if (run == need) {
+				unsigned s = i + 1 - need;
+				void *p = (void *)(g_pk.cache + (uintptr_t)s * PK_GRAN);
+
+				if (!VirtualAlloc(p, (SIZE_T)need * PK_GRAN, MEM_COMMIT, PAGE_READWRITE))
+					return NULL;
+				for (j = s; j <= i; j++)
+					g_pk.owner[j] = t;
+				g_pk.live += (unsigned long long)need * PK_GRAN;
+				return (uint32_t *)p;
+			}
+		}
+		if (!pk_evict_one())
+			return NULL;
+	}
+}
+
+static void pk_convert(SwTexture *t, const unsigned char *src)
+{
+	if (t->fmt == D3DFMT_A8R8G8B8 || t->fmt == D3DFMT_X8R8G8B8) {
+		memcpy(t->pixels, src, (size_t)t->w * (size_t)t->h * 4u);
+		return;
+	}
+	t->native = (unsigned char *)src;
+	tex_native_to_argb(t);
+	t->native = NULL;
+}
+
+/* Under the lock. A slot from another pack names content this one lacks. */
+static int pk_known(unsigned long long off, unsigned len)
+{
+	unsigned i;
+
+	for (i = 0; i < PK_SLOTS; i++)
+		if (g_pk.tab[i].magic && g_pk.tab[i].off == off && g_pk.tab[i].len == len)
+			return 1;
+	return 0;
+}
+
+static void pk_lost(SwTexture *t)
+{
+	char msg[200];
+
+	if (++g_pk.lost <= 8) {
+		_snprintf(msg, sizeof(msg),
+			  "texpack: %ux%u texture names pack offset %llu (%u bytes), which this pack "
+			  "does not hold - painted magenta. The slot came with a different pack",
+			  t->w, t->h, t->pk_off, t->pk_len);
+		sw_log(msg);
+	}
+}
+
+/* Under the lock: the texture's content into its block. */
+static int pk_paint(SwTexture *t)
+{
+	const unsigned char *src = t->pk_buf;
+	unsigned char *tmp = NULL;
+	void *view = NULL;
+
+	if (!src && t->pk_off && !pk_known(t->pk_off, t->pk_len)) {
+		size_t i, n = (size_t)t->w * (size_t)t->h;
+
+		pk_lost(t);
+		for (i = 0; i < n; i++)
+			t->pixels[i] = 0xFFFF00FFu;
+		return 1;
+	}
+	if (!src && t->pk_off && t->pk_len >= t->native_size) {
+		unsigned long long at = t->pk_off & ~0xFFFFull;
+		size_t d = (size_t)(t->pk_off - at);
+
+		view = MapViewOfFile(g_pk.sec, FILE_MAP_READ, (DWORD)(at >> 32), (DWORD)at,
+				     d + t->native_size);
+		if (view) {
+			src = (const unsigned char *)view + d;
+		} else {
+			tmp = (unsigned char *)calloc(1, t->native_size);
+			if (!tmp || !pk_io(0, t->pk_off, tmp, t->native_size)) {
+				free(tmp);
+				g_pk.ioerr++;
+				return 0;
+			}
+			src = tmp;
+		}
+	}
+	if (src)
+		pk_convert(t, src);
+	else
+		memset(t->pixels, 0, (size_t)t->w * (size_t)t->h * 4u);
+	if (view)
+		UnmapViewOfFile(view);
+	free(tmp);
+	g_pk.paints++;
+	g_pk.paint_bytes += (unsigned long long)t->w * (unsigned long long)t->h * 4u;
+	return 1;
+}
+
+/* Before a draw reads t->pixels. */
+static void pk_ready(SwTexture *t)
+{
+	if (!t || t->iface.lpVtbl != &kTexVtbl || !t->pk || g_pk.state <= 0)
+		return;
+	t->pk_used = g_pk.frame;
+	if (!t->pk_stale && pk_owned(t))
+		return;
+	pk_take();
+	if (!pk_owned(t)) {
+		t->pixels = pk_alloc(t);
+		t->pk_gen = g_pk.gen;
+		if (!t->pixels) {
+			g_pk.misses++;
+			pk_give();
+			return;
+		}
+	} else {
+		swrast_flush_if_pending(t->pixels);
+	}
+	InterlockedExchange(&t->pk_stale, 0);
+	if (!pk_paint(t))
+		InterlockedExchange(&t->pk_stale, 1);
+	pk_give();
+}
+
+static unsigned char *pk_lock_tex(SwTexture *t)
+{
+	unsigned char *b = t->pk_buf;
+
+	if (b)
+		return b;
+	b = (unsigned char *)calloc(1, t->native_size ? t->native_size : 4);
+	if (!b)
+		return NULL;
+	pk_take();
+	if (t->pk_off && !pk_known(t->pk_off, t->pk_len))
+		pk_lost(t);
+	else if (t->pk_off && t->pk_len >= t->native_size &&
+		 !pk_io(0, t->pk_off, b, t->native_size))
+		g_pk.ioerr++;
+	pk_give();
+	t->pk_buf = b;
+	return b;
+}
+
+/* A store that fails leaves the buffer as the texture's content. */
+static void pk_unlock_tex(SwTexture *t)
+{
+	unsigned long long off;
+	unsigned char *b = NULL;
+
+	if (!t->pk_buf)
+		return;
+	if (pk_store(t->pk_buf, t->native_size, &off)) {
+		pk_take();
+		t->pk_off = off;
+		t->pk_len = t->native_size;
+		b = t->pk_buf;
+		t->pk_buf = NULL;
+		pk_give();
+	}
+	InterlockedExchange(&t->pk_stale, 1);
+	free(b);
+}
+
+static void pk_release(SwTexture *t)
+{
+	if (g_pk.state > 0) {
+		pk_take();
+		if (pk_owned(t))
+			pk_free(t);
+		pk_give();
+	}
+	free_live(t->pk_buf);
+	t->pk_buf = NULL;
+	t->pixels = NULL;
+}
+
+/* Every object a load brought back names blocks from before it. */
+static void pk_after_load(void)
+{
+	if (g_pk.state <= 0)
+		return;
+	pk_take();
+	memset(g_pk.owner, 0, (size_t)g_pk.ngran * sizeof(SwTexture *));
+	g_pk.live = 0;
+	g_pk.gen = pk_newgen();
+	g_pk.loads++;
+	pk_give();
+}
+
+static void pk_frame_end(void)
+{
+	char msg[320];
+
+	if (g_pk.state <= 0)
+		return;
+	g_pk.frame++;
+	if (g_pk.frame % 1800)
+		return;
+	_snprintf(msg, sizeof(msg),
+		  "texpack: frame %u - cache %llu of %u MB; %u paint(s) %llu MB, %u eviction(s), "
+		  "%u draw(s) with no room; pack %llu MB in %u content(s), %u stored, %u "
+		  "already there; %u i/o error(s); %u load(s); %u not in this pack",
+		  g_pk.frame, g_pk.live >> 20, (unsigned)((g_pk.size - PK_HEAD) >> 20), g_pk.paints,
+		  g_pk.paint_bytes >> 20, g_pk.evicts, g_pk.misses, g_pk.end >> 20, g_pk.nblob,
+		  g_pk.stores, g_pk.hits, g_pk.ioerr, g_pk.loads, g_pk.lost);
+	sw_log(msg);
+}
+
 static HRESULT WINAPI Tex_SetAutoGenFilterType(IDirect3DTexture9 *this, D3DTEXTUREFILTERTYPE f)
 {
 	(void)this;
@@ -3822,6 +4995,7 @@ static HRESULT WINAPI Tex_LockRect(IDirect3DTexture9 *this, UINT level, D3DLOCKE
 {
 	SwTexture *t = tex_from(this);
 	UINT n = t->nlevels ? t->nlevels : 1;
+	tp_disarm(t);
 	swrast_flush_if_pending(t->pixels);
 	(void)flags;
 	(void)rect;
@@ -3829,7 +5003,12 @@ static HRESULT WINAPI Tex_LockRect(IDirect3DTexture9 *this, UINT level, D3DLOCKE
 		return D3DERR_INVALIDCALL;
 	if (level != 0)
 		return D3DERR_INVALIDCALL;
-	if (t->native) {
+	if (t->pk) {
+		lr->Pitch = (INT)t->native_pitch;
+		lr->pBits = pk_lock_tex(t);
+		if (!lr->pBits)
+			return E_OUTOFMEMORY;
+	} else if (t->native) {
 		lr->Pitch = (INT)t->native_pitch;
 		lr->pBits = t->native;
 	} else {
@@ -3860,9 +5039,12 @@ static HRESULT WINAPI Tex_UnlockRect(IDirect3DTexture9 *this, UINT level)
 {
 	SwTexture *t = tex_from(this);
 	(void)level;
-	if (t->native && !t->native_is_pixels)
+	if (t->pk)
+		pk_unlock_tex(t);
+	else if (t->native && !t->native_is_pixels)
 		tex_native_to_argb(t);
 	dump_tex_once(t, NULL);
+	tp_arm(t);
 	return D3D_OK;
 }
 
@@ -3916,10 +5098,12 @@ static ULONG WINAPI Surf_Release(IDirect3DSurface9 *this)
 				s->tex->level0 = NULL;
 			s->tex->iface.lpVtbl->Release(&s->tex->iface);
 		}
-		if (s->own_bits)
-			free(s->bits);
+		if (s->own_bits) {
+			rt_forget(s->bits);
+			free_live(s->bits);
+		}
 		priv_free_all(s->priv);
-		free(s);
+		free_live(s);
 	}
 	return (ULONG)n;
 }
@@ -4018,6 +5202,8 @@ static HRESULT WINAPI Surf_LockRect(IDirect3DSurface9 *this, D3DLOCKED_RECT *lr,
 	SwSurface *s = surf_from(this);
 	unsigned char *bits = NULL;
 	int w, h, pitch;
+	if (s->tex)
+		tp_disarm(s->tex);
 	swrast_flush_if_pending(s->tex ? (const void *)s->tex->pixels : (const void *)s->bits);
 	(void)flags;
 	if (!lr)
@@ -4025,7 +5211,12 @@ static HRESULT WINAPI Surf_LockRect(IDirect3DSurface9 *this, D3DLOCKED_RECT *lr,
 	if (s->tex) {
 		w = s->tex->w;
 		h = s->tex->h;
-		if (s->tex->native) {
+		if (s->tex->pk) {
+			pitch = (int)s->tex->native_pitch;
+			bits = pk_lock_tex(s->tex);
+			if (!bits)
+				return E_OUTOFMEMORY;
+		} else if (s->tex->native) {
 			pitch = (int)s->tex->native_pitch;
 			bits = s->tex->native;
 		} else {
@@ -4064,8 +5255,12 @@ static HRESULT WINAPI Surf_UnlockRect(IDirect3DSurface9 *this)
 {
 	SwSurface *s = surf_from(this);
 	if (s->tex) {
-		tex_native_to_argb(s->tex);
+		if (s->tex->pk)
+			pk_unlock_tex(s->tex);
+		else
+			tex_native_to_argb(s->tex);
 		dump_tex_once(s->tex, NULL);
+		tp_arm(s->tex);
 	}
 	return D3D_OK;
 }
@@ -4256,8 +5451,8 @@ static ULONG WINAPI VB_Release(IDirect3DVertexBuffer9 *this)
 	SwVB *b = vb_from(this);
 	LONG n = InterlockedDecrement(&b->ref);
 	if (n == 0) {
-		free(b->bytes);
-		free(b);
+		free_live(b->bytes);
+		free_live(b);
 	}
 	return (ULONG)n;
 }
@@ -4386,8 +5581,8 @@ static ULONG WINAPI IB_Release(IDirect3DIndexBuffer9 *this)
 	SwIB *b = ib_from(this);
 	LONG n = InterlockedDecrement(&b->ref);
 	if (n == 0) {
-		free(b->bytes);
-		free(b);
+		free_live(b->bytes);
+		free_live(b);
 	}
 	return (ULONG)n;
 }
@@ -4519,26 +5714,40 @@ static HRESULT WINAPI Dev_CreateTexture(IDirect3DDevice9 *this, UINT width, UINT
 	t->usage = usage;
 	t->pool = pool;
 	t->nlevels = levels ? (levels > 16 ? 16 : levels) : 1u;
-	t->pixels = (uint32_t *)calloc((size_t)width * (size_t)height, sizeof(uint32_t));
+	t->native_pitch = tex_fmt_pitch(fmt, width);
+	t->native_size = tex_fmt_size(fmt, width, height);
+	if (pool == D3DPOOL_MANAGED && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) &&
+	    (size_t)width * (size_t)height * 4u >= PK_MIN && pk_on()) {
+		t->pk = 1;
+		if (fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8) {
+			t->native_pitch = width * 4u;
+			t->native_size = width * height * 4u;
+		}
+		goto made;
+	}
+	t->pixels = (uint32_t *)(pool == D3DPOOL_DEFAULT ? sw_calloc_present : calloc)(
+		(size_t)width * (size_t)height, sizeof(uint32_t));
 	if (!t->pixels) {
 		free(t);
 		return E_OUTOFMEMORY;
 	}
-	t->native_pitch = tex_fmt_pitch(fmt, width);
-	t->native_size = tex_fmt_size(fmt, width, height);
 	if (fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8) {
 		t->native = (unsigned char *)t->pixels;
 		t->native_is_pixels = 1;
 		t->native_pitch = width * 4u;
 		t->native_size = width * height * 4u;
 	} else {
-		t->native = (unsigned char *)calloc(1, t->native_size ? t->native_size : 4);
+		t->native = (unsigned char *)(pool == D3DPOOL_DEFAULT ? sw_calloc_present : calloc)(
+			1, t->native_size ? t->native_size : 4);
 		if (!t->native) {
 			free(t->pixels);
 			free(t);
 			return E_OUTOFMEMORY;
 		}
 	}
+	if (usage & D3DUSAGE_RENDERTARGET)
+		rt_note(t->pixels, (size_t)width * (size_t)height);
+made:
 	nth = InterlockedIncrement(&ncreate);
 	if (nth <= 48 || (nth & 1023) == 0) {
 		char msg[160];
@@ -4548,6 +5757,7 @@ static HRESULT WINAPI Dev_CreateTexture(IDirect3DDevice9 *this, UINT width, UINT
 			  (unsigned)pool);
 		sw_trace("%s", msg);
 	}
+	tp_add(t);
 	*out = &t->iface;
 	return D3D_OK;
 }
@@ -4562,6 +5772,7 @@ static HRESULT WINAPI Dev_UpdateTexture(IDirect3DDevice9 *this, IDirect3DBaseTex
 	(void)this;
 	if (!src || !dst)
 		return D3DERR_INVALIDCALL;
+	pk_ready(s);
 	if (!s->pixels || !d->pixels)
 		return D3D_OK;
 	w = s->w < d->w ? s->w : d->w;
@@ -4586,7 +5797,7 @@ static HRESULT WINAPI Dev_CreateVertexBuffer(IDirect3DDevice9 *this, UINT length
 	b = (SwVB *)calloc(1, sizeof(*b));
 	if (!b)
 		return E_OUTOFMEMORY;
-	b->bytes = (unsigned char *)calloc(1, length);
+	b->bytes = (unsigned char *)(pool == D3DPOOL_DEFAULT ? sw_calloc_present : calloc)(1, length);
 	if (!b->bytes) {
 		free(b);
 		return E_OUTOFMEMORY;
@@ -4616,7 +5827,7 @@ static HRESULT WINAPI Dev_CreateIndexBuffer(IDirect3DDevice9 *this, UINT length,
 	b = (SwIB *)calloc(1, sizeof(*b));
 	if (!b)
 		return E_OUTOFMEMORY;
-	b->bytes = (unsigned char *)calloc(1, length);
+	b->bytes = (unsigned char *)(pool == D3DPOOL_DEFAULT ? sw_calloc_present : calloc)(1, length);
 	if (!b->bytes) {
 		free(b);
 		return E_OUTOFMEMORY;
@@ -4704,6 +5915,62 @@ static HRESULT WINAPI Dev_GetSamplerState(IDirect3DDevice9 *this, DWORD sampler,
 	return D3D_OK;
 }
 
+/* Pixel stores of render targets, so a load from another launch can blank them:
+ * what they hold is the saving launch's last frame, and left in place it shows
+ * through wherever the game does not draw again. Lives in .swbss, so after a
+ * load this lists the saving launch's targets, which is what is in memory. */
+#define RT_MAX 256
+static struct {
+	uint32_t *px;
+	size_t n;
+} g_rt[RT_MAX];
+
+static void rt_note(uint32_t *px, size_t n)
+{
+	int i;
+
+	for (i = 0; i < RT_MAX; i++)
+		if (!g_rt[i].px) {
+			g_rt[i].n = n;
+			g_rt[i].px = px;
+			return;
+		}
+}
+
+static void rt_forget(const void *px)
+{
+	int i;
+
+	for (i = 0; px && i < RT_MAX; i++)
+		if (g_rt[i].px == px)
+			g_rt[i].px = NULL;
+}
+
+static void rt_blank_all(void)
+{
+	MEMORY_BASIC_INFORMATION mi;
+	unsigned long long kb = 0;
+	int i, n = 0, bad = 0;
+
+	for (i = 0; i < RT_MAX; i++) {
+		uintptr_t a = (uintptr_t)g_rt[i].px;
+
+		if (!a)
+			continue;
+		if (!VirtualQuery((void *)a, &mi, sizeof(mi)) || mi.State != MEM_COMMIT ||
+		    !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) ||
+		    a + g_rt[i].n * 4 > (uintptr_t)mi.BaseAddress + mi.RegionSize) {
+			bad++;
+			continue;
+		}
+		memset(g_rt[i].px, 0, g_rt[i].n * 4);
+		kb += g_rt[i].n * 4 / 1024;
+		n++;
+	}
+	sw_trace("load: blanked %d render target(s), %llu KB; %d listed but not writable here",
+		 n, kb, bad);
+}
+
 static SwSurface *make_plain_surface(IDirect3DDevice9 *dev, int w, int h, D3DFORMAT fmt,
 				     DWORD usage, int alloc_bits)
 {
@@ -4721,12 +5988,16 @@ static SwSurface *make_plain_surface(IDirect3DDevice9 *dev, int w, int h, D3DFOR
 	s->usage = usage;
 	s->pitch = w * 4;
 	if (alloc_bits) {
-		s->bits = calloc((size_t)w * (size_t)h, 4);
+		/* Only the game's render targets and depth surfaces get here: the
+		 * back buffer is the rasterizer's own and allocates nothing. */
+		s->bits = sw_calloc_present((size_t)w * (size_t)h, 4);
 		if (!s->bits) {
 			free(s);
 			return NULL;
 		}
 		s->own_bits = 1;
+		if (usage & D3DUSAGE_RENDERTARGET)
+			rt_note((uint32_t *)s->bits, (size_t)w * (size_t)h);
 	}
 	return s;
 }
@@ -4892,6 +6163,8 @@ static int surf_pixels(SwSurface *s, uint32_t **pixels, int *w, int *h, int *pit
 {
 	if (!s || !pixels || !w || !h || !pitch)
 		return 0;
+	if (s->tex)
+		pk_ready(s->tex);
 	if (s->tex && s->tex->pixels) {
 		*pixels = s->tex->pixels;
 		*w = s->tex->w;
@@ -5556,8 +6829,8 @@ static ULONG WINAPI Decl_Release(IDirect3DVertexDeclaration9 *this)
 	SwDecl *d = decl_from(this);
 	LONG n = InterlockedDecrement(&d->ref);
 	if (n == 0) {
-		free(d->elems);
-		free(d);
+		free_live(d->elems);
+		free_live(d);
 	}
 	return (ULONG)n;
 }
@@ -5728,8 +7001,8 @@ static ULONG WINAPI VS_Release(IDirect3DVertexShader9 *this)
 	SwShader *s = sh_from_vs(this);
 	LONG n = InterlockedDecrement(&s->ref);
 	if (n == 0) {
-		free(s->code);
-		free(s);
+		free_live(s->code);
+		free_live(s);
 	}
 	return (ULONG)n;
 }
@@ -6420,6 +7693,8 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *this, UINT adapter, D3DDEVTYP
 	dev->parent->iface.lpVtbl->AddRef(&dev->parent->iface);
 	dev->focus = focus;
 	dev->device_window = hwnd;
+	g_live_window = hwnd;
+	g_live_focus = focus;
 	ime_detach_window(hwnd);
 	if (focus != hwnd)
 		ime_detach_window(focus);
@@ -6498,6 +7773,12 @@ static HRESULT WINAPI D3D_CreateDevice(IDirect3D9 *this, UINT adapter, D3DDEVTYP
 		return E_OUTOFMEMORY;
 	}
 	*out = &dev->iface;
+	{
+		static LONG first;
+
+		if (InterlockedCompareExchange(&first, 1, 0) == 0)
+			phase_snapshot("device");
+	}
 	return D3D_OK;
 }
 
@@ -6605,14 +7886,19 @@ static void log_env_once(void)
 IDirect3D9 *WINAPI Direct3DCreate9(UINT sdk)
 {
 	SwD3D9 *d;
-	static LONG wrapped;
+	static LONG wrapped, first;
 	(void)sdk;
+	/* Before any of our own setup below: what the game built on its own. */
+	if (InterlockedCompareExchange(&first, 1, 0) == 0)
+		phase_snapshot("game-to-dll");
 	ime_detach_process();
 	savestate_hooks_install();
 	ensure_dev_vtbl();
 	if (InterlockedCompareExchange(&wrapped, 1, 0) == 0)
 		d3d9_trace_wrap_d3d((void **)&kD3DVtbl, sizeof(kD3DVtbl));
 	sw_trace("Direct3DCreate9 sdk=%u", sdk);
+	/* Before anything reads a setting, including the banner below. */
+	load_ini_once();
 	log_env_once();
 	/* Before the game creates its window, so it is sized in real pixels
 	 * from the start rather than being reinterpreted underneath us. */
@@ -6623,6 +7909,24 @@ IDirect3D9 *WINAPI Direct3DCreate9(UINT sdk)
 	d->iface.lpVtbl = &kD3DVtbl;
 	d->ref = 1;
 	return &d->iface;
+}
+
+int gameheap_install_imports(void);
+
+/* At attach, not at Direct3DCreate9: the game imports this DLL, so its modules
+ * are bound but have not allocated yet. Does nothing unless D3D9SW_GAMEHEAP=2.
+ * The pregame inventory goes first, before our own hooks change anything. */
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+{
+	(void)inst;
+	(void)reserved;
+	if (reason == DLL_PROCESS_ATTACH) {
+		phase_snapshot("pregame");
+		savestate_reserve_home();
+		gameheap_install_imports();
+		phase_snapshot("dll-load");
+	}
+	return TRUE;
 }
 
 /* test.exe --dump uses this to read pixels without going through COM. */

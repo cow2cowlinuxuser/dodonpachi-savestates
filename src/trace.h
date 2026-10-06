@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 void sw_trace(const char *fmt, ...);
+void sw_trace_restart(const char *why);
 void d3d9_trace_wrap_dev(void **slots, size_t bytes);
 void d3d9_trace_wrap_d3d(void **slots, size_t bytes);
 

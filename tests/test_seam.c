@@ -660,7 +660,6 @@ static int d3d9_blit(const char *name, float shift, int bilinear, int simd)
 int main(void)
 {
 	int ok = 1;
-	int fan_leak = 0;
 	int simd;
 
 	fill_tex();
@@ -713,18 +712,10 @@ int main(void)
 		 * off-grid phase keep any edge from landing on a convenient
 		 * slope, and the fractional centre stops the whole figure from
 		 * being symmetric about a pixel boundary. */
-		/* Known issue, not a gate. Arbitrary-angle shared edges leak a
-		 * couple of pixels out of roughly 120,000 - real, but orders of
-		 * magnitude below anything visible, and unrelated to the seams
-		 * this suite was built to catch. Reported loudly and tracked
-		 * separately so it cannot quietly grow, but it does not fail the
-		 * run, because a suite that is red on arrival teaches everyone to
-		 * ignore it. */
-		fan_leak += !fan("fan, 64 spokes, integer centre", 256.0f, 256.0f, 200.0f, 64, 0.0f, simd);
-		fan_leak += !fan("fan, 61 spokes, phase 0.137", 256.3f, 255.7f, 200.0f, 61, 0.137f, simd);
-		fan_leak += !fan("fan, 199 spokes, phase 0.9", 256.5f, 256.5f, 220.0f, 199, 0.9f, simd);
-		fan_leak += !fan("fan, 360 spokes, tiny radius", 256.21875f, 256.09375f, 60.0f, 360, 0.31f,
-				 simd);
+		ok &= fan("fan, 64 spokes, integer centre", 256.0f, 256.0f, 200.0f, 64, 0.0f, simd);
+		ok &= fan("fan, 61 spokes, phase 0.137", 256.3f, 255.7f, 200.0f, 61, 0.137f, simd);
+		ok &= fan("fan, 199 spokes, phase 0.9", 256.5f, 256.5f, 220.0f, 199, 0.9f, simd);
+		ok &= fan("fan, 360 spokes, tiny radius", 256.21875f, 256.09375f, 60.0f, 360, 0.31f, simd);
 
 		/* Sampling, exactly 1:1 and point filtered: the output must be
 		 * the texture, unaltered. */
@@ -787,9 +778,6 @@ int main(void)
 		ok &= saw;
 	}
 
-	if (fan_leak)
-		printf("KNOWN ISSUE: %d fan case(s) leak a few pixels on arbitrary-angle"
-		       " shared edges. Tracked, not gating.\n", fan_leak);
 	printf("%s\n", ok ? "PASS: every interior pixel written exactly once"
 			  : "FAIL: coverage is not watertight");
 	swrast_pool_shutdown();

@@ -1,3 +1,5 @@
+/* See d3d9_sw.c: renderer statics, taken whole by a merge. */
+#pragma clang section bss = ".swbss" data = ".swdata"
 #include "swrast.h"
 
 #include <d3d9types.h>
@@ -10,6 +12,11 @@
 #include <string.h>
 
 #include "swalloc.h"
+
+#ifndef SS_PRESENT
+#define SS_PRESENT __attribute__((section(".sspres")))
+#endif
+void savestate_own_cs(CRITICAL_SECTION *cs) __attribute__((weak));
 
 static int iclamp(int v, int lo, int hi)
 {
@@ -210,6 +217,32 @@ static uint32_t modulate(uint32_t a, uint32_t b)
 	return out;
 }
 
+/* Fades a colour toward white in proportion to how transparent it is.
+ *
+ * Multiply blending scales the destination by the source, so a source that
+ * should contribute nothing has to be white: black is not "no change" under a
+ * multiply, it is "erase to black". A real pixel shader driving a multiply pass
+ * accounts for that and emits white where it wants no darkening. This renderer
+ * approximates pixel shaders with a texture modulate, which emits the raw texel
+ * instead, so a fully transparent texel arrives as black and punches a hole in
+ * whatever it covers. Folding alpha into the colour restores the identity: at
+ * alpha 0 the source is white and the destination survives untouched, at alpha
+ * 255 the multiply happens in full, and partial alpha darkens proportionally. */
+static uint32_t toward_white(uint32_t c, uint32_t a)
+{
+	uint32_t out = c & 0xFF000000u;
+	int ch;
+
+	for (ch = 0; ch < 3; ch++) {
+		int shift = ch * 8;
+		int v = (int)((c >> shift) & 255);
+
+		v = div255(v * (int)a + 255 * (int)(255 - a));
+		out |= (uint32_t)(v & 255) << shift;
+	}
+	return out;
+}
+
 /* Steepens the alpha ramp about its halfway point, leaving the colour alone.
  *
  * A distance field encodes the glyph edge at 0.5 and ramps across several texels
@@ -301,6 +334,25 @@ static uint32_t blend_add(uint32_t src, uint32_t dst, uint32_t sa)
 	return out;
 }
 
+/* dst*src, the scalar twin of span_blend_mod. Nothing here that blend_pixel
+ * would not also compute; it just skips the eight factor dispatches to get
+ * there, for the tiles the vector kernel still declines. */
+static uint32_t blend_mod(uint32_t src, uint32_t dst)
+{
+	uint32_t out = 0;
+	int ch;
+
+	for (ch = 0; ch < 4; ch++) {
+		int shift = ch * 8;
+		/* Both operands are 0..255, so the quotient cannot exceed 255 and
+		 * needs no clamp. */
+		out |= (uint32_t)div255((int)((src >> shift) & 255) *
+					(int)((dst >> shift) & 255))
+		       << shift;
+	}
+	return out;
+}
+
 static uint32_t blend_pixel(uint32_t src, uint32_t dst, const SwState *st)
 {
 	uint32_t out = 0;
@@ -373,6 +425,7 @@ void swrast_state_defaults(SwState *s)
 	s->addr_u = D3DTADDRESS_WRAP;
 	s->addr_v = D3DTADDRESS_WRAP;
 	s->write_mask = 0xffffffffu;
+	s->mul_identity = 0;
 }
 
 /* Zero for an inclusive (top or left) edge, otherwise a nudge small enough to
@@ -470,6 +523,55 @@ static int gather_mode(void)
 	}
 }
 
+int swrast_paintstat;
+/* Set for the frames being measured. The overdraw map is per pixel of the
+ * target being flushed, and tiles own disjoint pixels, so workers share it
+ * without locking. */
+static int g_ps_live;
+static uint8_t *g_ps_cnt;
+static const uint32_t *g_ps_cnt_color;
+
+/* Masks are lane bits relative to o, and pairwise disjoint. o[i] is how many
+ * writes pixel i has taken since it was last replaced outright. */
+static void ps_note(unsigned long long *ps, uint8_t *o, unsigned cov, unsigned kill,
+		    unsigned zero, unsigned noop, unsigned opq)
+{
+	unsigned rmw = cov & ~(kill | zero | noop | opq), m;
+
+	ps[SWPS_SHADED] += (unsigned)__builtin_popcount(cov);
+	ps[SWPS_KILLED] += (unsigned)__builtin_popcount(kill);
+	ps[SWPS_ZERO] += (unsigned)__builtin_popcount(zero);
+	ps[SWPS_NOOP] += (unsigned)__builtin_popcount(noop);
+	ps[SWPS_OPAQUE] += (unsigned)__builtin_popcount(opq);
+	ps[SWPS_RMW] += (unsigned)__builtin_popcount(rmw);
+	if (!o)
+		return;
+	for (m = opq; m; m &= m - 1) {
+		int i = __builtin_ctz(m);
+		ps[SWPS_HIDDEN] += o[i];
+		o[i] = 1;
+	}
+	for (m = rmw; m; m &= m - 1) {
+		int i = __builtin_ctz(m);
+		if (o[i] < 255)
+			o[i]++;
+	}
+}
+
+static void ps_note1(unsigned long long *ps, uint8_t *o, int kind)
+{
+	ps[SWPS_SHADED]++;
+	ps[kind]++;
+	if (!o)
+		return;
+	if (kind == SWPS_OPAQUE) {
+		ps[SWPS_HIDDEN] += *o;
+		*o = 1;
+	} else if (kind == SWPS_RMW && *o < 255) {
+		(*o)++;
+	}
+}
+
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
 #define SWRAST_X86 1
 #include <immintrin.h>
@@ -484,21 +586,58 @@ typedef struct SwSpan {
 	uint32_t *crow;
 	const uint32_t *texels;
 	int tw_mask, th_mask, tw_shift;
-	/* Set when texel addressing must clamp and index by row stride rather
-	 * than mask and shift; tw_shift and the masks are then unused. */
+	/* Set when texel addressing cannot be a mask and shift, and indexes by
+	 * row stride instead; tw_shift and the masks are then unused, and
+	 * mode_u/mode_v say how each axis is folded into range. */
 	int clamp_idx, tw, th, stride;
+	int mode_u, mode_v;
+	float inv_tw, inv_th;
 	float tw_f, th_f;
 	int bilinear, persp, white, seq_u;
 	uint32_t flat;
 	int alpha_test, alpha_func, alpha_ref;
-	int blend_over, blend_add;
+	int blend_over, blend_add, blend_mod, mul_identity;
 	float w0, w1, w2, dw0, dw1, dw2;
 	float u, v, du, dv, iw, diw;
+	unsigned long long *ps; /* paint statistics slot, NULL when not measuring */
+	uint8_t *orow;		/* overdraw map row, indexed like crow */
 } SwSpan;
 
-/* Only the addressing and blend modes the fast path claims to handle. */
-static int span_kernel_ok(const SwTex *t, int addr_u, int addr_v, int uv_in_bounds)
+/* How one texel axis is folded into range, mirroring addr_coord exactly. */
+enum { IDX_MASK, IDX_CLAMP, IDX_WRAP, IDX_MIRROR, IDX_MIRROR1 };
+
+static int idx_mode(int addr, int n)
 {
+	switch (addr) {
+	case D3DTADDRESS_CLAMP:
+	case D3DTADDRESS_BORDER:
+		return IDX_CLAMP;
+	case D3DTADDRESS_MIRROR:
+		return IDX_MIRROR;
+	case D3DTADDRESS_MIRRORONCE:
+		return IDX_MIRROR1;
+	default:
+		return (n & (n - 1)) ? IDX_WRAP : IDX_MASK;
+	}
+}
+
+/* The vector modulo divides in float, which is exact only while texel
+ * coordinates stay well inside 24 bits. Past that the triangle goes scalar. */
+#define SPAN_MOD_LIMIT 4194304.0f
+
+/* Only the addressing and blend modes the fast path claims to handle.
+ *
+ * Every addressing mode now has a vector form for any dimensions. Wrap and
+ * mirror on a non-power-of-two texture are what a repeating parallax
+ * background asks for, and before they had one those layers alone put a
+ * quarter of the heaviest frames on the scalar path. uv_small says the
+ * triangle's texel coordinates are inside the range the vector modulo is
+ * exact for, which only matters for those two. */
+static int span_kernel_ok(const SwTex *t, int addr_u, int addr_v, int uv_in_bounds,
+			  int uv_small)
+{
+	int mu, mv;
+
 	if (!t || !t->pixels || t->width <= 0 || t->height <= 0)
 		return 0;
 	/* Addressing only has to be emulated where a coordinate can actually
@@ -506,17 +645,10 @@ static int span_kernel_ok(const SwTex *t, int addr_u, int addr_v, int uv_in_boun
 	 * behaves alike and arbitrary dimensions index by row stride. */
 	if (uv_in_bounds)
 		return 1;
-	/* Clamping is expressible in the vector index path for any dimensions,
-	 * and the scalar sampler resolves BORDER to a clamp too. This is what
-	 * lets a full-surface upscale blit off a non-power-of-two target take the
-	 * fast path: its coordinates reach the very edge, so no in-bounds
-	 * argument applies, but clamping is still the correct answer there. */
-	if ((addr_u == D3DTADDRESS_CLAMP || addr_u == D3DTADDRESS_BORDER) &&
-	    (addr_v == D3DTADDRESS_CLAMP || addr_v == D3DTADDRESS_BORDER))
-		return 1;
-	if ((t->width & (t->width - 1)) || (t->height & (t->height - 1)))
-		return 0;
-	if (addr_u != D3DTADDRESS_WRAP || addr_v != D3DTADDRESS_WRAP)
+	mu = idx_mode(addr_u, t->width);
+	mv = idx_mode(addr_v, t->height);
+	if ((mu == IDX_WRAP || mu == IDX_MIRROR || mv == IDX_WRAP || mv == IDX_MIRROR) &&
+	    !uv_small)
 		return 0;
 	return 1;
 }
@@ -529,18 +661,53 @@ static int log2i(int v)
 	return n;
 }
 
+/* x mod n into 0..n-1 for any sign, as wrap_coord does. The float quotient can
+ * be one out either way near a multiple of n, and the two corrections take it
+ * back; SPAN_MOD_LIMIT keeps x where that bound holds. */
+__attribute__((target("avx2")))
+static __m256i span_mod(__m256i x, int n, float inv_n)
+{
+	__m256i vn = _mm256_set1_epi32(n);
+	__m256 q = _mm256_floor_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(x), _mm256_set1_ps(inv_n)));
+	__m256i r = _mm256_sub_epi32(x, _mm256_mullo_epi32(_mm256_cvtps_epi32(q), vn));
+
+	r = _mm256_add_epi32(r, _mm256_and_si256(_mm256_cmpgt_epi32(_mm256_setzero_si256(), r), vn));
+	r = _mm256_sub_epi32(r, _mm256_andnot_si256(_mm256_cmpgt_epi32(vn, r), vn));
+	return r;
+}
+
+__attribute__((target("avx2")))
+static __m256i span_axis(__m256i x, int mode, int n, float inv_n)
+{
+	__m256i top = _mm256_set1_epi32(n - 1);
+
+	switch (mode) {
+	case IDX_MASK:
+		return _mm256_and_si256(x, top);
+	case IDX_WRAP:
+		return span_mod(x, n, inv_n);
+	case IDX_MIRROR: {
+		/* Period 2n, the second half read backwards. */
+		__m256i m = span_mod(x, 2 * n, 0.5f * inv_n);
+		__m256i back = _mm256_sub_epi32(_mm256_set1_epi32(2 * n - 1), m);
+		return _mm256_blendv_epi8(m, back, _mm256_cmpgt_epi32(m, top));
+	}
+	case IDX_MIRROR1:
+		return _mm256_min_epi32(_mm256_abs_epi32(x), top);
+	default:
+		return _mm256_min_epi32(_mm256_max_epi32(x, _mm256_setzero_si256()), top);
+	}
+}
+
 __attribute__((target("avx2")))
 static __m256i span_idx(const SwSpan *s, __m256i xi, __m256i yi)
 {
-	/* Clamp into range and scale by the real row stride, which works for any
-	 * dimensions. This is exactly what the scalar sampler does for CLAMP and
-	 * BORDER (iclamp to 0..n-1), so the two paths agree bit for bit. */
+	/* Fold each axis into range and scale by the real row stride, which works
+	 * for any dimensions. Each mode is the vector twin of its addr_coord
+	 * case, so the two paths agree bit for bit. */
 	if (s->clamp_idx) {
-		__m256i zero = _mm256_setzero_si256();
-		xi = _mm256_min_epi32(_mm256_max_epi32(xi, zero),
-				      _mm256_set1_epi32(s->tw - 1));
-		yi = _mm256_min_epi32(_mm256_max_epi32(yi, zero),
-				      _mm256_set1_epi32(s->th - 1));
+		xi = span_axis(xi, s->mode_u, s->tw, s->inv_tw);
+		yi = span_axis(yi, s->mode_v, s->th, s->inv_th);
 		return _mm256_add_epi32(
 			_mm256_mullo_epi32(yi, _mm256_set1_epi32(s->stride)), xi);
 	}
@@ -775,6 +942,58 @@ static __m256i span_blend_add(__m256i src, __m256i dst, __m256i sa)
 	}
 }
 
+/* dst*src, every channel. src=ZERO with dst=SRCCOLOR reduces to exactly that:
+ * the source contributes nothing of itself and only scales what is already
+ * there. Alpha is multiplied like any other channel because the factor is the
+ * colour, so unlike over and add there is no alpha term to shortcut on.
+ * Matches blend_pixel()'s div255 rounding. */
+__attribute__((target("avx2")))
+static __m256i span_blend_mod(__m256i src, __m256i dst)
+{
+	const __m256i lomask = _mm256_set1_epi32(0x00ff00ff);
+	/* 255*255 + 128 is 65153, so every 16-bit lane stays below 65536. */
+	__m256i srb = _mm256_and_si256(src, lomask);
+	__m256i sag = _mm256_and_si256(_mm256_srli_epi32(src, 8), lomask);
+	__m256i drb = _mm256_and_si256(dst, lomask);
+	__m256i dag = _mm256_and_si256(_mm256_srli_epi32(dst, 8), lomask);
+	__m256i rb = _mm256_add_epi16(_mm256_mullo_epi16(srb, drb),
+				      _mm256_set1_epi16(128));
+	__m256i ag = _mm256_add_epi16(_mm256_mullo_epi16(sag, dag),
+				      _mm256_set1_epi16(128));
+
+	rb = _mm256_srli_epi16(_mm256_add_epi16(rb, _mm256_srli_epi16(rb, 8)), 8);
+	ag = _mm256_srli_epi16(_mm256_add_epi16(ag, _mm256_srli_epi16(ag, 8)), 8);
+	return _mm256_or_si256(_mm256_and_si256(rb, lomask),
+			       _mm256_slli_epi32(_mm256_and_si256(ag, lomask), 8));
+}
+
+/* The vector twin of toward_white: colour channels become c*a + 255*(255-a)
+ * over 255, alpha is kept. The sum is at most 255*255, so with the rounding
+ * term it stays inside a 16-bit lane. */
+__attribute__((target("avx2")))
+static __m256i span_toward_white(__m256i col)
+{
+	const __m256i lomask = _mm256_set1_epi32(0x00ff00ff);
+	__m256i a = _mm256_srli_epi32(col, 24);
+	__m256i a16 = _mm256_or_si256(a, _mm256_slli_epi32(a, 16));
+	__m256i fill = _mm256_add_epi16(
+		_mm256_mullo_epi16(_mm256_sub_epi16(lomask, a16), lomask),
+		_mm256_set1_epi16(128));
+	__m256i rb = _mm256_add_epi16(
+		_mm256_mullo_epi16(_mm256_and_si256(col, lomask), a16), fill);
+	__m256i ag = _mm256_add_epi16(
+		_mm256_mullo_epi16(_mm256_and_si256(_mm256_srli_epi32(col, 8), lomask), a16),
+		fill);
+
+	rb = _mm256_srli_epi16(_mm256_add_epi16(rb, _mm256_srli_epi16(rb, 8)), 8);
+	ag = _mm256_srli_epi16(_mm256_add_epi16(ag, _mm256_srli_epi16(ag, 8)), 8);
+	return _mm256_or_si256(
+		_mm256_and_si256(_mm256_or_si256(_mm256_and_si256(rb, lomask),
+						 _mm256_slli_epi32(_mm256_and_si256(ag, lomask), 8)),
+				 _mm256_set1_epi32(0x00ffffff)),
+		_mm256_slli_epi32(a, 24));
+}
+
 __attribute__((target("avx2")))
 static __m256i span_alpha_pass(int func, __m256i alpha, int ref)
 {
@@ -807,6 +1026,54 @@ static void span_store_evex(uint32_t *dst, __m256i live, __m256i col)
 {
 	__mmask8 k = (__mmask8)_mm256_movemask_ps(_mm256_castsi256_ps(live));
 	_mm256_mask_storeu_epi32(dst, k, col);
+}
+
+/* Classifies one group of lanes the way the blend below will treat them. Kept
+ * out of line and fed through pointers so the measuring branch costs the hot
+ * loop nothing in registers when it is off. */
+__attribute__((noinline, target("avx2")))
+static void span_note(const SwSpan *s, int x, unsigned cov, const __m256i *livep,
+		      const __m256i *colp)
+{
+	__m256i live = *livep, col = *colp;
+	__m256i alpha = _mm256_srli_epi32(col, 24);
+	__m256i rgb = _mm256_and_si256(col, _mm256_set1_epi32(0x00ffffff));
+	unsigned pass = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(live));
+	unsigned a0 = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+		_mm256_cmpeq_epi32(alpha, _mm256_setzero_si256())));
+	unsigned a255 = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+		_mm256_cmpeq_epi32(alpha, _mm256_set1_epi32(255))));
+	unsigned black = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+		_mm256_cmpeq_epi32(rgb, _mm256_setzero_si256())));
+	unsigned white = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+		_mm256_cmpeq_epi32(rgb, _mm256_set1_epi32(0x00ffffff))));
+	unsigned kill = cov & ~pass, zero = 0, noop = 0, opq = 0;
+
+	if (s->blend_over) {
+		zero = pass & a0;
+		opq = pass & a255;
+	} else if (s->blend_add) {
+		zero = pass & a0;
+		noop = pass & ~a0 & black;
+	} else if (s->blend_mod) {
+		noop = pass & white;
+	} else {
+		opq = pass;
+	}
+	ps_note(s->ps, s->orow ? s->orow + x : NULL, cov, kill, zero, noop, opq);
+	s->ps[SWPS_VEC] += (unsigned)__builtin_popcount(cov);
+	if (cov == 0xffu) {
+		__m256i first = _mm256_permutevar8x32_epi32(col, _mm256_setzero_si256());
+		s->ps[SWPS_FULL8] += 8;
+		if (_mm256_movemask_epi8(_mm256_cmpeq_epi32(col, first)) == -1) {
+			unsigned a = (unsigned)_mm256_cvtsi256_si32(col) >> 24;
+			s->ps[SWPS_UNIFORM] += 8;
+			if (a == 0)
+				s->ps[SWPS_UNIF_CLEAR] += 8;
+			else if (a == 255)
+				s->ps[SWPS_UNIF_OPAQUE] += 8;
+		}
+	}
 }
 
 __attribute__((target("avx2")))
@@ -850,11 +1117,20 @@ static void span_avx2(const SwSpan *s, int xs, int xe)
 		col = span_sample(s, u, v, live);
 		if (!s->white)
 			col = span_modulate(col, s->flat);
+		if (s->mul_identity)
+			col = span_toward_white(col);
 
 		alpha = _mm256_srli_epi32(col, 24);
-		if (s->alpha_test)
-			live = _mm256_and_si256(live,
-						span_alpha_pass(s->alpha_func, alpha, s->alpha_ref));
+		{
+			unsigned cov = s->ps ? (unsigned)_mm256_movemask_ps(
+						       _mm256_castsi256_ps(live))
+					     : 0;
+			if (s->alpha_test)
+				live = _mm256_and_si256(
+					live, span_alpha_pass(s->alpha_func, alpha, s->alpha_ref));
+			if (s->ps)
+				span_note(s, x, cov, &live, &col);
+		}
 
 		if (s->blend_over) {
 			/* Fully transparent writes nothing, fully opaque skips the
@@ -876,6 +1152,13 @@ static void span_avx2(const SwSpan *s, int xs, int xe)
 								    live);
 				col = span_blend_add(col, dst, alpha);
 			}
+		} else if (s->blend_mod) {
+			/* No alpha shortcut here. A transparent source still
+			 * multiplies the destination to black, which is the whole
+			 * point of the mode, so every live lane must be read. */
+			__m256i dst = _mm256_maskload_epi32((const int *)(s->crow + x), live);
+
+			col = span_blend_mod(col, dst);
 		}
 		if (evex)
 			span_store_evex(s->crow + x, live, col);
@@ -886,7 +1169,10 @@ static void span_avx2(const SwSpan *s, int xs, int xe)
 #endif /* SWRAST_X86 */
 
 enum { SR_OK, SR_NOAVX2, SR_NOTEX, SR_NOTFLAT, SR_DEPTH, SR_MASK, SR_BLEND, SR_NPOT,
-       SR_ADDR, SR_OTHER, SR_N };
+       SR_ADDR, SR_OTHER, SR_N,
+       /* Not a reason: the part of SR_OK folded by wrap or mirror at any
+	* dimensions, which is the path the parallax layers now take. */
+       SR_FOLD = SR_N, SR_NX };
 
 /* Unlike every other counter here, this one is reached from the tile workers, so
  * a single shared array would put eight cores on one cache line and serialise
@@ -895,13 +1181,36 @@ enum { SR_OK, SR_NOAVX2, SR_NOTEX, SR_NOTFLAT, SR_DEPTH, SR_MASK, SR_BLEND, SR_N
 #define SR_SLOTS 33
 #define SR_STRIDE 16 /* doubles: 128 bytes, so no slot shares a line */
 static double g_simd_area[SR_SLOTS * SR_STRIDE];
-/* 0 is the thread that drives the flush; workers claim 1..n. */
-static __thread int g_worker_slot;
+/* 0 is the thread that drives the flush; workers claim 1..n.
+ *
+ * Held as a table of thread ids rather than a __thread int on purpose. Being
+ * held keeps this module's statics out of the rewind, but thread-local storage
+ * is not this module's: the loader allocates the per-thread block and the array
+ * that indexes it on a process heap, and that heap we do rewind. A restore can
+ * therefore leave the array slot reading back as zero, and the next worker to
+ * touch the variable reads through a null block - which is exactly the fault at
+ * address 4 that ended the 01:50 session. A table in our own data cannot go
+ * that way. */
+static DWORD g_worker_tid[SR_SLOTS - 1];
+/* Paint statistics, same slotting. 16 counters of 8 bytes fill the stride, and
+ * the per-thread ones are everything before SWPS_TILES. */
+static unsigned long long g_ps[SR_SLOTS * SR_STRIDE];
+
+static int worker_slot(void)
+{
+	DWORD id = GetCurrentThreadId();
+	int i;
+
+	for (i = 0; i < SR_SLOTS - 1; i++)
+		if (g_worker_tid[i] == id)
+			return i + 1;
+	return 0;
+}
 
 void swrast_prof_simd(double *out, int n)
 {
 	int i, s;
-	for (i = 0; i < n && i < SR_N; i++) {
+	for (i = 0; i < n && i < SR_NX; i++) {
 		double t = 0;
 		for (s = 0; s < SR_SLOTS; s++) {
 			t += g_simd_area[s * SR_STRIDE + i];
@@ -925,13 +1234,17 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 	int persp, textured, flat_col, depth_test, depth_write;
 	SwTex ltex;
 	int l_bilinear, l_addr_u, l_addr_v, l_z_func, l_alpha_test, l_alpha_func;
-	int l_alpha_ref, l_blend, l_blend_over, l_blend_add, l_white, l_alpha_sharpen;
+	int l_alpha_ref, l_blend, l_blend_over, l_blend_add, l_blend_mod, l_white,
+		l_alpha_sharpen;
 #ifdef SWRAST_X86
 	int use_simd = 0;
 	SwSpan simd_span;
 #endif
 	uint32_t l_mask;
+	int l_mul_identity;
 	uint32_t *idbase;
+	unsigned long long *ps = NULL;
+	uint8_t *obase = NULL;
 
 	if (!r->color)
 		return;
@@ -1036,6 +1349,7 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 	l_alpha_sharpen = st->alpha_sharpen == 256 ? 0 : st->alpha_sharpen;
 	l_blend = st->blend_enable;
 	l_mask = st->write_mask;
+	l_mul_identity = st->mul_identity;
 	/* Alpha-over and additive cover essentially every sprite this game draws;
 	 * the generic path costs eight switch dispatches per pixel. */
 	l_blend_over = l_blend && st->blend_op == D3DBLENDOP_ADD &&
@@ -1043,19 +1357,31 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 		       st->dst_blend == D3DBLEND_INVSRCALPHA;
 	l_blend_add = l_blend && st->blend_op == D3DBLENDOP_ADD &&
 		      st->src_blend == D3DBLEND_SRCALPHA && st->dst_blend == D3DBLEND_ONE;
+	/* Multiply. Measured at 23% of the town's shaded area and, because the
+	 * scalar path costs roughly six times what the vector one does, at well
+	 * over half its raster time. */
+	l_blend_mod = l_blend && st->blend_op == D3DBLENDOP_ADD &&
+		      st->src_blend == D3DBLEND_ZERO && st->dst_blend == D3DBLEND_SRCCOLOR;
 	/* An opaque white vertex colour makes the modulate a no-op. */
 	l_white = flat_col && a.color == 0xffffffffu;
 #ifdef SWRAST_X86
 	use_simd = simd_enabled() && (swrast_cpu_features() & CPU_AVX2) && textured &&
 		   flat_col &&
 		   !depth_test && !depth_write && !idbase && l_mask == 0xffffffffu &&
-		   (!l_blend || l_blend_over || l_blend_add) &&
+		   (!l_blend || l_blend_over || l_blend_add || l_blend_mod) &&
 		   /* Alpha sharpening is not in the vector kernel, and the two
 		    * paths have to agree pixel for pixel. Only text asks for it,
 		    * which the mix counters put at about one percent of area, so
 		    * sending those draws down the scalar path costs nothing. */
 		   !l_alpha_sharpen &&
-		   span_kernel_ok(&ltex, l_addr_u, l_addr_v, st->uv_in_bounds);
+		   span_kernel_ok(&ltex, l_addr_u, l_addr_v, st->uv_in_bounds,
+				  textured &&
+					  fmaxf(fmaxf(fabsf(a.u), fabsf(b.u)), fabsf(c.u)) *
+							  (float)ltex.width <
+						  SPAN_MOD_LIMIT &&
+					  fmaxf(fmaxf(fabsf(a.v), fabsf(b.v)), fabsf(c.v)) *
+							  (float)ltex.height <
+						  SPAN_MOD_LIMIT);
 	if (use_simd) {
 		memset(&simd_span, 0, sizeof(simd_span));
 		simd_span.texels = ltex.pixels;
@@ -1063,12 +1389,16 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 		simd_span.th_mask = ltex.height - 1;
 		simd_span.tw_shift = log2i(ltex.width);
 		/* Mask and shift are only valid for a power-of-two surface under
-		 * WRAP; everything else the gate now admits goes through the
-		 * clamping stride path. */
-		simd_span.clamp_idx = (ltex.width & (ltex.width - 1)) ||
-				      (ltex.height & (ltex.height - 1)) ||
-				      l_addr_u != D3DTADDRESS_WRAP ||
-				      l_addr_v != D3DTADDRESS_WRAP;
+		 * WRAP; everything else the gate admits goes through the stride
+		 * path with each axis folded by its own mode. In-bounds coordinates
+		 * need no folding, and there a clamp is what this always did. */
+		simd_span.mode_u = idx_mode(l_addr_u, ltex.width);
+		simd_span.mode_v = idx_mode(l_addr_v, ltex.height);
+		simd_span.clamp_idx = simd_span.mode_u != IDX_MASK || simd_span.mode_v != IDX_MASK;
+		if (simd_span.clamp_idx && st->uv_in_bounds)
+			simd_span.mode_u = simd_span.mode_v = IDX_CLAMP;
+		simd_span.inv_tw = 1.0f / (float)ltex.width;
+		simd_span.inv_th = 1.0f / (float)ltex.height;
 		simd_span.tw = ltex.width;
 		simd_span.th = ltex.height;
 		simd_span.stride = ltex.width;
@@ -1083,6 +1413,8 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 		simd_span.alpha_ref = l_alpha_ref;
 		simd_span.blend_over = l_blend_over;
 		simd_span.blend_add = l_blend_add;
+		simd_span.blend_mod = l_blend_mod;
+		simd_span.mul_identity = l_mul_identity;
 		simd_span.dw0 = dw0dx;
 		simd_span.dw1 = dw1dx;
 		simd_span.dw2 = dw2dx;
@@ -1156,8 +1488,10 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 			reason = SR_DEPTH;
 		else if (idbase || l_mask != 0xffffffffu)
 			reason = SR_MASK;
-		else if (l_blend && !l_blend_over && !l_blend_add)
+		else if (l_blend && !l_blend_over && !l_blend_add && !l_blend_mod)
 			reason = SR_BLEND;
+		else if (l_alpha_sharpen)
+			reason = SR_OTHER;
 		else if (!use_simd &&
 			 ((ltex.width & (ltex.width - 1)) || (ltex.height & (ltex.height - 1))))
 			reason = SR_NPOT;
@@ -1169,17 +1503,31 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 		reason = SR_NOAVX2;
 #endif
 		{
-			int slot = g_worker_slot;
-			if (slot < 0 || slot >= SR_SLOTS)
-				slot = 0;
-			g_simd_area[slot * SR_STRIDE + reason] +=
-				(double)(maxx - minx + 1) * (double)(maxy - miny + 1);
+			int slot = worker_slot();
+			double bb = (double)(maxx - minx + 1) * (double)(maxy - miny + 1);
+			g_simd_area[slot * SR_STRIDE + reason] += bb;
+#ifdef SWRAST_X86
+			if (use_simd && simd_span.clamp_idx &&
+			    (simd_span.mode_u == IDX_WRAP || simd_span.mode_u == IDX_MIRROR ||
+			     simd_span.mode_u == IDX_MIRROR1 || simd_span.mode_v == IDX_WRAP ||
+			     simd_span.mode_v == IDX_MIRROR || simd_span.mode_v == IDX_MIRROR1))
+				g_simd_area[slot * SR_STRIDE + SR_FOLD] += bb;
+#endif
+			if (g_ps_live) {
+				ps = &g_ps[slot * SR_STRIDE];
+				if (g_ps_cnt && g_ps_cnt_color == r->color)
+					obase = g_ps_cnt;
+			}
 		}
 	}
+#ifdef SWRAST_X86
+	simd_span.ps = ps;
+#endif
 
 	for (y = miny; y <= maxy; y++) {
 		uint32_t *crow = r->color + (size_t)y * w;
 		uint32_t *idrow = idbase ? idbase + (size_t)y * w : NULL;
+		uint8_t *orow = obase ? obase + (size_t)y * w : NULL;
 		float *drow = r->depth ? r->depth + (size_t)y * w : NULL;
 		int xs = minx, xe = maxx;
 		float off;
@@ -1212,6 +1560,7 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 #ifdef SWRAST_X86
 		if (use_simd) {
 			simd_span.crow = crow;
+			simd_span.orow = orow;
 			simd_span.w0 = w0_xs;
 			simd_span.w1 = w1_xs;
 			simd_span.w2 = w2_xs;
@@ -1238,8 +1587,12 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 			zz = dzdx * kf + z_xs;
 			iw = diwdx * kf + iw_xs;
 			if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
-				if (depth_test && !cmp_func(l_z_func, zz, drow[x]))
+				int pk = SWPS_OPAQUE;
+				if (depth_test && !cmp_func(l_z_func, zz, drow[x])) {
+					if (ps)
+						ps_note1(ps, NULL, SWPS_KILLED);
 					goto next_pixel;
+				}
 				if (textured) {
 					uint32_t texel;
 					if (persp) {
@@ -1268,32 +1621,55 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 				}
 				if (l_alpha_sharpen)
 					col = sharpen_alpha(col, l_alpha_sharpen);
+				if (l_mul_identity)
+					col = toward_white(col, col >> 24);
 				if (l_alpha_test &&
 				    !cmp_func(l_alpha_func, (float)((col >> 24) & 255),
-					      (float)l_alpha_ref))
+					      (float)l_alpha_ref)) {
+					if (ps)
+						ps_note1(ps, NULL, SWPS_KILLED);
 					goto next_pixel;
+				}
 				if (depth_write)
 					drow[x] = zz;
 				if (l_blend) {
 					uint32_t sa = col >> 24;
+					pk = SWPS_RMW;
 					if (l_blend_over) {
 						if (sa == 255) {
 							/* fully opaque: dst drops out */
+							pk = SWPS_OPAQUE;
 						} else if (sa == 0) {
+							if (ps)
+								ps_note1(ps, NULL, SWPS_ZERO);
 							goto next_pixel;
 						} else {
 							col = blend_over(col, crow[x], sa);
 						}
 					} else if (l_blend_add) {
-						if (sa == 0)
+						if (sa == 0) {
+							if (ps)
+								ps_note1(ps, NULL, SWPS_ZERO);
 							goto next_pixel;
+						}
+						if (!(col & 0x00ffffffu))
+							pk = SWPS_NOOP;
 						col = blend_add(col, crow[x], sa);
+					} else if (l_blend_mod) {
+						if ((col & 0x00ffffffu) == 0x00ffffffu)
+							pk = SWPS_NOOP;
+						col = blend_mod(col, crow[x]);
 					} else {
 						col = blend_pixel(col, crow[x], st);
 					}
 				}
-				if (l_mask != 0xffffffffu)
+				if (l_mask != 0xffffffffu) {
 					col = (col & l_mask) | (crow[x] & ~l_mask);
+					if (pk == SWPS_OPAQUE)
+						pk = SWPS_RMW;
+				}
+				if (ps)
+					ps_note1(ps, orow ? orow + x : NULL, pk);
 				crow[x] = col;
 				if (idrow)
 					idrow[x] = draw;
@@ -1311,7 +1687,6 @@ static void triangle_rect(SwRast *r, SwVert a, SwVert b, SwVert c, const SwTex *
 	}
 }
 
-#define SWRAST_MAX_THREADS 32
 /* The default below is tuned for the D3D9 title, whose flush already fits in
  * the frame budget. A backend whose flush overruns by an order of magnitude
  * wants every core instead, so the cap is overridable at build time. */
@@ -1346,9 +1721,9 @@ typedef struct SwTile {
 	unsigned cap;
 } SwTile;
 
-static HANDLE g_wake[SWRAST_MAX_THREADS];
-static HANDLE g_thread[SWRAST_MAX_THREADS];
-static HANDLE g_done;
+static HANDLE g_wake[SWRAST_MAX_THREADS] SS_PRESENT;
+static HANDLE g_thread[SWRAST_MAX_THREADS] SS_PRESENT;
+static HANDLE g_done SS_PRESENT;
 static volatile LONG g_left;
 static volatile int g_die;
 static int g_nthreads;
@@ -1404,6 +1779,87 @@ static int g_tiles_x, g_tiles_y;
 static volatile LONG g_next_tile;
 static volatile LONG g_tile_total;
 static int g_wake_n;
+
+/* Per-target state for the paint statistics. A frame is built across several
+ * targets, and both the overdraw map and the tile comparison only mean
+ * something against the same target, so each is kept separately. */
+#define PS_TARGETS 8
+static struct PsTarget {
+	const uint32_t *color;
+	int w, h, tiles;
+	uint8_t *cnt;	    /* writes since last opaque replace, per pixel */
+	uint64_t *cur, *prev; /* per tile: hash of everything drawn this frame */
+	uint32_t *px;	    /* per tile: pixels shaded this frame */
+	int sampled;	    /* read as a texture since its map was last reset */
+	unsigned used;
+} g_pst[PS_TARGETS];
+static unsigned g_ps_frame;
+static int g_ps_prev_live;
+static uint64_t *g_ps_tile_h;
+static uint32_t *g_ps_tile_px;
+static uint64_t *g_ps_batch_h;
+static unsigned g_ps_batch_cap;
+/* Single-threaded totals: the binner and the frame boundary. */
+static double g_ps_tot[SWPS_N];
+
+static uint64_t ps_mix(uint64_t h, const void *p, size_t n)
+{
+	const uint32_t *w = (const uint32_t *)p;
+	size_t i;
+	for (i = 0; i < n / 4; i++)
+		h = (h ^ w[i]) * 0x100000001b3ull;
+	return h;
+}
+
+static void ps_target_free(struct PsTarget *t)
+{
+	free(t->cnt);
+	free(t->cur);
+	free(t->prev);
+	free(t->px);
+	memset(t, 0, sizeof(*t));
+}
+
+static struct PsTarget *ps_target(const SwRast *r)
+{
+	struct PsTarget *t, *victim = &g_pst[0];
+	int k, tx, ty;
+
+	for (k = 0; k < PS_TARGETS; k++) {
+		t = &g_pst[k];
+		if (t->color == r->color && t->w == r->width && t->h == r->height) {
+			t->used = g_ps_frame;
+			return t->cnt ? t : NULL;
+		}
+		if (!t->color || t->used < victim->used)
+			victim = t;
+		if (!t->color)
+			break;
+	}
+	ps_target_free(victim);
+	tx = (r->width + SWRAST_TILE - 1) >> SWRAST_TILE_SHIFT;
+	ty = (r->height + SWRAST_TILE - 1) >> SWRAST_TILE_SHIFT;
+	victim->color = r->color;
+	victim->w = r->width;
+	victim->h = r->height;
+	victim->tiles = tx * ty;
+	victim->used = g_ps_frame;
+	victim->cnt = (uint8_t *)calloc((size_t)r->width * (size_t)r->height, 1);
+	victim->cur = (uint64_t *)calloc((size_t)victim->tiles, sizeof(uint64_t));
+	victim->prev = (uint64_t *)calloc((size_t)victim->tiles, sizeof(uint64_t));
+	victim->px = (uint32_t *)calloc((size_t)victim->tiles, sizeof(uint32_t));
+	if (!victim->cnt || !victim->cur || !victim->prev || !victim->px) {
+		free(victim->cnt);
+		free(victim->cur);
+		free(victim->prev);
+		free(victim->px);
+		victim->cnt = NULL;
+		victim->cur = victim->prev = NULL;
+		victim->px = NULL;
+		return NULL;
+	}
+	return victim;
+}
 
 static DWORD WINAPI tile_worker(LPVOID param);
 
@@ -1489,6 +1945,55 @@ int swrast_thread_count(void)
 	return g_nthreads;
 }
 
+/* Non-tile work for the same pool, between flushes. Only the thread that
+ * flushes may call it, so the two never share the wake/done handshake. */
+static void (*volatile g_job_fn)(void *arg, int worker, int job);
+static void *g_job_arg;
+static volatile LONG g_next_job;
+static LONG g_job_total;
+
+static void job_loop(int worker)
+{
+	for (;;) {
+		LONG j = InterlockedIncrement(&g_next_job) - 1;
+		if (j >= g_job_total)
+			break;
+		g_job_fn(g_job_arg, worker, (int)j);
+	}
+}
+
+int swrast_parallel(int njobs, int max_threads, void (*fn)(void *arg, int worker, int job),
+		    void *arg)
+{
+	int i, wake;
+
+	if (njobs <= 0)
+		return 0;
+	ensure_pool();
+	wake = max_threads - 1;
+	if (wake > g_nthreads)
+		wake = g_nthreads;
+	if (wake > njobs - 1)
+		wake = njobs - 1;
+	g_job_arg = arg;
+	g_job_total = njobs;
+	g_next_job = 0;
+	if (wake < 1) {
+		for (i = 0; i < njobs; i++)
+			fn(arg, SWRAST_MAX_THREADS, i);
+		return 1;
+	}
+	g_job_fn = fn;
+	g_left = wake;
+	ResetEvent(g_done);
+	for (i = 0; i < wake; i++)
+		SetEvent(g_wake[i]);
+	job_loop(SWRAST_MAX_THREADS);
+	WaitForSingleObject(g_done, INFINITE);
+	g_job_fn = NULL;
+	return wake + 1;
+}
+
 /* Retires the worker threads so their stacks stop existing. A snapshot taken
  * while they are parked would capture stacks we then rewind underneath live
  * threads; tearing the pool down removes them from the address space instead.
@@ -1535,26 +2040,65 @@ static void run_tile(int t)
 		x1 = g_target.width;
 	if (y1 > g_target.height)
 		y1 = g_target.height;
-	for (i = 0; i < tile->count; i++) {
-		const SwBinTri *bt = &g_tris[tile->idx[i]];
-		const SwBatch *ba = &g_batches[bt->batch];
-		triangle_rect(&g_target, bt->a, bt->b, bt->c, ba->has_tex ? &ba->tex : NULL,
-			      &ba->st, x0, x1, y0, y1, bt->draw);
+	/* A tile can outlive the arrays it indexes into.
+	 *
+	 * The bins hold indices; the triangles and batches they index live in
+	 * realloc'd memory, and our data section is deliberately left in the present
+	 * while the C runtime heap it allocates from is rewound. So a restore can
+	 * hand a resumed worker a tile with a stale count and arrays that are no
+	 * longer the ones it was binned against. Four workers faulted here at once,
+	 * two frames after a restore, reading offset 4 of a null batch.
+	 *
+	 * Dropping the tile loses at most one frame that was already being thrown
+	 * away by the restore. Not dropping it kills the process and, worse, files
+	 * the report under our name instead of whatever the game was doing. */
+	if (!g_tris || !g_batches)
+		return;
+	{
+		unsigned long long *ps = g_ps_tile_h ? &g_ps[worker_slot() * SR_STRIDE] : NULL;
+		unsigned long long shaded0 = ps ? ps[SWPS_SHADED] : 0;
+
+		for (i = 0; i < tile->count; i++) {
+			const SwBinTri *bt = &g_tris[tile->idx[i]];
+			const SwBatch *ba = &g_batches[bt->batch];
+			triangle_rect(&g_target, bt->a, bt->b, bt->c,
+				      ba->has_tex ? &ba->tex : NULL, &ba->st, x0, x1, y0, y1,
+				      bt->draw);
+		}
+		/* Vertices and batch state are everything the tile's pixels are a
+		 * function of, given the texture generations the batch hash carries.
+		 * Folded into the frame's running hash, because a target can be
+		 * flushed several times in one frame. */
+		if (ps && tile->count) {
+			uint64_t h = g_ps_tile_h[t] ? g_ps_tile_h[t] : 0xcbf29ce484222325ull;
+
+			for (i = 0; i < tile->count; i++) {
+				const SwBinTri *bt = &g_tris[tile->idx[i]];
+				h = ps_mix(h, &bt->a, 3 * sizeof(SwVert));
+				h = (h ^ g_ps_batch_h[bt->batch]) * 0x100000001b3ull;
+			}
+			g_ps_tile_h[t] = h | 1;
+			g_ps_tile_px[t] += (uint32_t)(ps[SWPS_SHADED] - shaded0);
+		}
 	}
 }
 
 static DWORD WINAPI tile_worker(LPVOID param)
 {
-	g_worker_slot = (int)(intptr_t)param + 1;
+	g_worker_tid[(int)(intptr_t)param] = GetCurrentThreadId();
 	for (;;) {
 		WaitForSingleObject(g_wake[(int)(intptr_t)param], INFINITE);
 		if (g_die)
 			return 0;
-		for (;;) {
-			LONG t = InterlockedIncrement(&g_next_tile) - 1;
-			if (t >= g_tile_total)
-				break;
-			run_tile((int)t);
+		if (g_job_fn) {
+			job_loop((int)(intptr_t)param);
+		} else {
+			for (;;) {
+				LONG t = InterlockedIncrement(&g_next_tile) - 1;
+				if (t >= g_tile_total)
+					break;
+				run_tile((int)t);
+			}
 		}
 		if (InterlockedDecrement(&g_left) == 0)
 			SetEvent(g_done);
@@ -1580,7 +2124,8 @@ void swrast_flush_if_pending(const void *pixels)
 	unsigned i;
 	if (!g_have_target || g_tri_count == 0 || !pixels)
 		return;
-	if ((const void *)g_target.color == pixels) {
+	if ((const void *)g_target.color == pixels ||
+	    (const void *)g_target.depth == pixels) {
 		swrast_flush();
 		return;
 	}
@@ -1648,6 +2193,42 @@ enum { MIX_TEX, MIX_BILIN, MIX_OVER, MIX_ADD, MIX_BLENDOTHER, MIX_ATEST, MIX_ZTE
        MIX_FLAT, MIX_LINEARU, MIX_N };
 static double g_mix[MIX_N];
 
+/* Distinct blend triples that reached neither fast path, with the area each
+ * painted. Eight is plenty: the whole game has only ever shown three src/dst
+ * pairs, so anything beyond a handful means the assumption is wrong. */
+#define BLEND_OTHER_N 8
+static struct {
+	int op, src, dst;
+	double area;
+} g_blend_other[BLEND_OTHER_N];
+
+/* Sorted by area, largest first, so the caller can print only the top few.
+ * Reading clears, matching every other counter in this file. */
+int swrast_prof_blend_other(int *op, int *src, int *dst, double *area, int n)
+{
+	int got = 0, i, k;
+
+	for (i = 0; i < n; i++) {
+		int best = -1;
+
+		for (k = 0; k < BLEND_OTHER_N; k++)
+			if (g_blend_other[k].area > 0.0 &&
+			    (best < 0 || g_blend_other[k].area > g_blend_other[best].area))
+				best = k;
+		if (best < 0)
+			break;
+		op[got] = g_blend_other[best].op;
+		src[got] = g_blend_other[best].src;
+		dst[got] = g_blend_other[best].dst;
+		area[got] = g_blend_other[best].area;
+		g_blend_other[best].area = 0.0;
+		got++;
+	}
+	for (k = 0; k < BLEND_OTHER_N; k++)
+		g_blend_other[k].area = 0.0;
+	return got;
+}
+
 void swrast_prof_mix(double *out, int n)
 {
 	int i;
@@ -1661,6 +2242,25 @@ static double g_prof_raster_ms;
 static unsigned g_prof_flushes, g_prof_tris, g_prof_bins;
 static double g_prof_area, g_prof_bbox;
 static int g_prof_tw, g_prof_th;
+
+/* Geometry that was binned nowhere because an allocation failed.
+ *
+ * Both binning failures used to be silent, and silence is the worst possible
+ * behaviour for this one: a triangle dropped from one tile's list and kept in
+ * its neighbour's leaves a hole on a 64-pixel boundary showing whatever the
+ * buffer held before, which reads as a black rectangle over a cleared target
+ * and as a piece of an older scene over one that was not. Counted so the
+ * question "are we failing to draw, or drawing something wrong" has an answer
+ * rather than a theory. */
+static unsigned g_prof_drop_tris, g_prof_drop_tiles;
+
+void swrast_prof_drops(unsigned *tris, unsigned *tiles)
+{
+	if (tris)
+		*tris = g_prof_drop_tris;
+	if (tiles)
+		*tiles = g_prof_drop_tiles;
+}
 
 void swrast_prof_take2(double *area, double *bbox, int *tw, int *th)
 {
@@ -1716,6 +2316,41 @@ void swrast_flush(void)
 	g_prof_tris += g_tri_count;
 	g_tile_total = g_tiles_x * g_tiles_y;
 	g_next_tile = 0;
+	if (g_ps_live) {
+		struct PsTarget *pt = ps_target(&g_target);
+
+		if (g_batch_count > g_ps_batch_cap) {
+			uint64_t *nb = (uint64_t *)realloc(g_ps_batch_h,
+							   (size_t)g_batch_count * sizeof(uint64_t));
+			if (nb) {
+				g_ps_batch_h = nb;
+				g_ps_batch_cap = g_batch_count;
+			}
+		}
+		if (pt && pt->tiles == g_tile_total && g_batch_count <= g_ps_batch_cap) {
+			unsigned b;
+
+			for (b = 0; b < g_batch_count; b++) {
+				const SwBatch *ba = &g_batches[b];
+				uint64_t h = ps_mix(0xcbf29ce484222325ull, &ba->st, sizeof(SwState));
+				uint32_t tk[5] = { (uint32_t)ba->has_tex,
+						   (uint32_t)(uintptr_t)ba->tex.pixels,
+						   (uint32_t)ba->tex.width, (uint32_t)ba->tex.height,
+						   ba->tex.gen };
+				g_ps_batch_h[b] = ps_mix(h, tk, sizeof(tk));
+			}
+			/* Sampled since the map was last reset: what it held was
+			 * seen, so covering it now buries nothing. */
+			if (pt->sampled) {
+				memset(pt->cnt, 0, (size_t)pt->w * (size_t)pt->h);
+				pt->sampled = 0;
+			}
+			g_ps_cnt = pt->cnt;
+			g_ps_cnt_color = g_target.color;
+			g_ps_tile_h = pt->cur;
+			g_ps_tile_px = pt->px;
+		}
+	}
 	/* Most flushes touch a handful of tiles. Waking every worker for those
 	 * costs more in signalling and wakeups than the tiles are worth, and on a
 	 * CPU-only host that overhead is the product's whole budget. */
@@ -1744,6 +2379,10 @@ void swrast_flush(void)
 		for (t = 0; t < (unsigned)g_tile_total; t++)
 			g_prof_bins += g_tiles[t].count;
 	}
+	g_ps_cnt = NULL;
+	g_ps_cnt_color = NULL;
+	g_ps_tile_h = NULL;
+	g_ps_tile_px = NULL;
 	QueryPerformanceCounter(&t1);
 	QueryPerformanceFrequency(&fq);
 	g_prof_raster_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart;
@@ -1813,6 +2452,78 @@ static unsigned batch_for(const SwTex *tex, const SwState *st)
 	return g_batch_count++;
 }
 
+/* Screen area drawn as axis-aligned quads: two triangles sharing a diagonal of
+ * one rectangle. Those could be walked as a rectangle instead of two bounding
+ * boxes, and when their texels map at a fixed integer scale with no rotation
+ * they are a blit rather than a rasterisation. */
+static void ps_rects(const SwRast *r, const SwTri *tris, int count, const SwTex *tex)
+{
+	int i;
+
+	for (i = 0; i + 1 < count; i++) {
+		const SwVert *v[6] = { &tris[i].a,     &tris[i].b,     &tris[i].c,
+				       &tris[i + 1].a, &tris[i + 1].b, &tris[i + 1].c };
+		const SwVert *cn[4] = { NULL, NULL, NULL, NULL };
+		float x0 = v[0]->x, x1 = x0, y0 = v[0]->y, y1 = y0, cx0, cx1, cy0, cy1, area;
+		unsigned seen[2] = { 0, 0 };
+		int k;
+
+		for (k = 1; k < 6; k++) {
+			x0 = fminf(x0, v[k]->x);
+			x1 = fmaxf(x1, v[k]->x);
+			y0 = fminf(y0, v[k]->y);
+			y1 = fmaxf(y1, v[k]->y);
+		}
+		if (!(x1 - x0 >= 0.5f) || !(y1 - y0 >= 0.5f))
+			continue;
+		for (k = 0; k < 6; k++) {
+			int cx = v[k]->x == x0 ? 0 : v[k]->x == x1 ? 1 : -1;
+			int cy = v[k]->y == y0 ? 0 : v[k]->y == y1 ? 1 : -1;
+			if (cx < 0 || cy < 0)
+				break;
+			cn[cx | cy << 1] = v[k];
+			seen[k / 3] |= 1u << (cx | cy << 1);
+		}
+		/* Each triangle three distinct corners, missing opposite ones:
+		 * anything else overlaps or leaves a gap. */
+		if (k < 6 || __builtin_popcount(seen[0]) != 3 || __builtin_popcount(seen[1]) != 3)
+			continue;
+		{
+			unsigned missing = (seen[0] ^ 15u) | (seen[1] ^ 15u);
+			if (missing != 9u && missing != 6u)
+				continue;
+		}
+		cx0 = fmaxf(x0, 0.0f);
+		cy0 = fmaxf(y0, 0.0f);
+		cx1 = fminf(x1, (float)r->width);
+		cy1 = fminf(y1, (float)r->height);
+		i++;
+		if (cx1 <= cx0 || cy1 <= cy0)
+			continue;
+		area = (cx1 - cx0) * (cy1 - cy0);
+		g_ps_tot[SWPS_RECT] += area;
+		if (x0 <= 0.0f && y0 <= 0.0f && x1 >= (float)r->width && y1 >= (float)r->height) {
+			g_ps_tot[SWPS_RECT_FULL] += area;
+			g_ps_tot[SWPS_RECT_FULL_N] += 1.0;
+		}
+		if (tex && tex->pixels && cn[0]->u == cn[2]->u && cn[1]->u == cn[3]->u &&
+		    cn[0]->v == cn[1]->v && cn[2]->v == cn[3]->v) {
+			float sx = fabsf((cn[1]->u - cn[0]->u) * (float)tex->width / (x1 - x0));
+			float sy = fabsf((cn[2]->v - cn[0]->v) * (float)tex->height / (y1 - y0));
+
+			if (fabsf(sx - 1.0f) < 1.0e-3f && fabsf(sy - 1.0f) < 1.0e-3f) {
+				g_ps_tot[SWPS_RECT_1TO1] += area;
+			} else if (sx > 0.0f && sy > 0.0f) {
+				float kx = 1.0f / sx, ky = 1.0f / sy;
+				if (kx >= 1.99f && ky >= 1.99f &&
+				    fabsf(kx - roundf(kx)) < 1.0e-3f * kx &&
+				    fabsf(ky - roundf(ky)) < 1.0e-3f * ky)
+					g_ps_tot[SWPS_RECT_INT] += area;
+			}
+		}
+	}
+}
+
 void swrast_triangles(SwRast *r, const SwTri *tris, int count, const SwTex *tex,
 		      const SwState *st)
 {
@@ -1859,8 +2570,28 @@ void swrast_triangles(SwRast *r, const SwTri *tris, int count, const SwTex *tex,
 			g_mix[MIX_OVER] += total;
 		else if (add)
 			g_mix[MIX_ADD] += total;
-		else if (st->blend_enable)
+		else if (st->blend_enable) {
+			int k;
+
 			g_mix[MIX_BLENDOTHER] += total;
+			/* Which blend is turning the vector kernel away. The mix
+			 * counter says how much area takes the scalar path but not
+			 * what it is, and the per-texture report logs src and dst
+			 * without the operation - which is the one field both fast
+			 * paths insist on, so it is the one that can hide here. */
+			for (k = 0; k < BLEND_OTHER_N; k++) {
+				if (g_blend_other[k].area == 0.0 ||
+				    (g_blend_other[k].op == st->blend_op &&
+				     g_blend_other[k].src == st->src_blend &&
+				     g_blend_other[k].dst == st->dst_blend)) {
+					g_blend_other[k].op = st->blend_op;
+					g_blend_other[k].src = st->src_blend;
+					g_blend_other[k].dst = st->dst_blend;
+					g_blend_other[k].area += total;
+					break;
+				}
+			}
+		}
 		if (st->alpha_test)
 			g_mix[MIX_ATEST] += total;
 		if (st->z_enable && r->depth)
@@ -1877,6 +2608,15 @@ void swrast_triangles(SwRast *r, const SwTri *tris, int count, const SwTex *tex,
 			    dv * (float)tex->height >= dy * 0.98f)
 				g_mix[MIX_LINEARU] += total;
 		}
+	}
+	if (g_ps_live) {
+		if (tex && tex->pixels) {
+			int k;
+			for (k = 0; k < PS_TARGETS; k++)
+				if (g_pst[k].color == tex->pixels)
+					g_pst[k].sampled = 1;
+		}
+		ps_rects(r, tris, count, tex);
 	}
 	idbuf_ensure(r);
 	g_draw_seq++;
@@ -1936,8 +2676,12 @@ void swrast_triangles(SwRast *r, const SwTri *tris, int count, const SwTex *tex,
 		if (g_tri_count == g_tri_cap) {
 			unsigned nc = g_tri_cap ? g_tri_cap * 2u : 4096u;
 			SwBinTri *nt = (SwBinTri *)realloc(g_tris, (size_t)nc * sizeof(SwBinTri));
-			if (!nt)
+			if (!nt) {
+				/* Abandons this triangle and every one after it in
+				 * the draw, so the count is the remainder, not one. */
+				g_prof_drop_tris += (unsigned)(count - i);
 				break;
+			}
 			g_tris = nt;
 			g_tri_cap = nc;
 		}
@@ -1951,8 +2695,73 @@ void swrast_triangles(SwRast *r, const SwTri *tris, int count, const SwTex *tex,
 		for (ty = y0 >> SWRAST_TILE_SHIFT; ty <= ((y1 - 1) >> SWRAST_TILE_SHIFT); ty++) {
 			for (tx = x0 >> SWRAST_TILE_SHIFT; tx <= ((x1 - 1) >> SWRAST_TILE_SHIFT);
 			     tx++)
-				tile_push(&g_tiles[ty * g_tiles_x + tx], slot);
+				if (!tile_push(&g_tiles[ty * g_tiles_x + tx], slot))
+					g_prof_drop_tiles++;
 		}
+	}
+}
+
+void swrast_paintstat_frame(void)
+{
+	int k, t, n;
+
+	if (!swrast_paintstat)
+		return;
+	swrast_flush();
+	if (g_ps_live) {
+		for (k = 0; k < PS_TARGETS; k++) {
+			struct PsTarget *pt = &g_pst[k];
+			unsigned touched = 0, same = 0;
+
+			if (!pt->cnt)
+				continue;
+			/* The first frame of a measured pair has nothing to compare
+			 * against, and counting it would halve the answer. */
+			for (t = 0; g_ps_prev_live && t < pt->tiles; t++) {
+				if (!pt->px[t])
+					continue;
+				touched++;
+				g_ps_tot[SWPS_TILE_PX] += pt->px[t];
+				if (pt->cur[t] == pt->prev[t]) {
+					same++;
+					g_ps_tot[SWPS_TILE_PX_SAME] += pt->px[t];
+				}
+			}
+			g_ps_tot[SWPS_TILES] += touched;
+			g_ps_tot[SWPS_TILES_SAME] += same;
+			if (touched) {
+				g_ps_tot[SWPS_TGT_FRAMES] += 1.0;
+				if (same == touched)
+					g_ps_tot[SWPS_TGT_STATIC] += 1.0;
+			}
+			memcpy(pt->prev, pt->cur, (size_t)pt->tiles * sizeof(uint64_t));
+			memset(pt->cur, 0, (size_t)pt->tiles * sizeof(uint64_t));
+			memset(pt->px, 0, (size_t)pt->tiles * sizeof(uint32_t));
+			/* What stands at the end of the frame was shown or sampled. */
+			memset(pt->cnt, 0, (size_t)pt->w * (size_t)pt->h);
+			pt->sampled = 0;
+		}
+		g_ps_tot[SWPS_FRAMES] += 1.0;
+	}
+	g_ps_prev_live = g_ps_live;
+	g_ps_frame++;
+	n = swrast_paintstat;
+	g_ps_live = n <= 1 || (g_ps_frame % (unsigned)n) < 2;
+}
+
+void swrast_prof_paint(double *out)
+{
+	int i, s;
+
+	for (i = 0; i < SWPS_N; i++) {
+		double v = g_ps_tot[i];
+		if (i < SWPS_TILES)
+			for (s = 0; s < SR_SLOTS; s++) {
+				v += (double)g_ps[s * SR_STRIDE + i];
+				g_ps[s * SR_STRIDE + i] = 0;
+			}
+		out[i] = v;
+		g_ps_tot[i] = 0.0;
 	}
 }
 
@@ -2017,6 +2826,20 @@ void swrast_clear_color(SwRast *r, uint32_t d3d_color)
 	n = (size_t)r->width * (size_t)r->height;
 	for (i = 0; i < n; i++)
 		r->color[i] = d3d_color;
+	/* A clear buries nothing it overwrites that counts: the previous frame
+	 * was presented or sampled. It is part of what every tile shows, though. */
+	if (g_ps_live) {
+		struct PsTarget *pt = ps_target(r);
+		int t;
+
+		if (pt) {
+			memset(pt->cnt, 0, n);
+			pt->sampled = 0;
+			for (t = 0; t < pt->tiles; t++)
+				pt->cur[t] = (((pt->cur[t] ? pt->cur[t] : 0xcbf29ce484222325ull) ^
+					       d3d_color) * 0x100000001b3ull) | 1;
+		}
+	}
 }
 
 void swrast_clear_depth(SwRast *r, float z)
@@ -2040,6 +2863,13 @@ static int swrast_scale_integer(void)
 	return cached;
 }
 
+static int (*g_gpu_present)(HWND, const uint32_t *, int, int);
+
+void swrast_set_gpu_present(int (*fn)(HWND, const uint32_t *, int, int))
+{
+	g_gpu_present = fn;
+}
+
 void swrast_present(SwRast *r, HWND hwnd_override)
 {
 	BITMAPINFO bmi;
@@ -2050,6 +2880,19 @@ void swrast_present(SwRast *r, HWND hwnd_override)
 
 	swrast_flush();
 	if (!r->color || !hwnd)
+		return;
+
+	/* Stage one of the hardware backend replaces this blit and nothing else.
+	 * The frame above it was rasterised exactly as before, so anything that
+	 * looks wrong on screen is in the presenting and not in a pixel. It
+	 * declines by returning zero whenever no device is up, which leaves the
+	 * GDI path below as the answer rather than a fallback nobody tested.
+	 *
+	 * Through a pointer rather than a direct call because the rasteriser is
+	 * linked into targets that have no hardware backend at all - the OpenGL
+	 * front end and the test harnesses - and none of them should have to
+	 * carry a device they will never create. */
+	if (g_gpu_present && g_gpu_present(hwnd, r->color, r->width, r->height))
 		return;
 
 	memset(&bmi, 0, sizeof(bmi));
@@ -2134,7 +2977,96 @@ void swrast_present(SwRast *r, HWND hwnd_override)
 
 	StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, r->width, r->height, r->color, &bmi,
 		      DIB_RGB_COLORS, SRCCOPY);
+	swrast_overlay_draw(hdc, cw);
 	ReleaseDC(hwnd, hdc);
+}
+
+/* A readout drawn straight onto the window DC after the frame.
+ *
+ * Onto the DC rather than into the framebuffer, because the framebuffer is the
+ * game's picture and may be scaled: text composited there would be stretched
+ * with everything else and, at a 640x360 render target upscaled to 1707x960,
+ * be unreadable. It also avoids needing a font in the rasteriser at all - GDI
+ * already owns this DC for the blit.
+ *
+ * The text is set from another thread than the one presenting, so it is copied
+ * under a lock rather than read in place. A short lock around a strcpy is
+ * cheaper than the alternative of tearing a line the whole point of which is to
+ * be read. */
+static CRITICAL_SECTION g_osd_cs;
+static LONG g_osd_ready;
+static char g_osd_text[256];
+
+static void osd_init_once(void)
+{
+	static LONG started;
+
+	if (InterlockedCompareExchange(&started, 1, 0) == 0) {
+		InitializeCriticalSection(&g_osd_cs);
+		if (savestate_own_cs)
+			savestate_own_cs(&g_osd_cs);
+		InterlockedExchange(&g_osd_ready, 1);
+		return;
+	}
+	while (!InterlockedCompareExchange(&g_osd_ready, 0, 0))
+		Sleep(0);
+}
+
+void swrast_overlay_set(const char *text)
+{
+	osd_init_once();
+	EnterCriticalSection(&g_osd_cs);
+	if (!text || !*text) {
+		g_osd_text[0] = 0;
+	} else {
+		size_t n = strlen(text);
+		if (n >= sizeof(g_osd_text))
+			n = sizeof(g_osd_text) - 1;
+		memcpy(g_osd_text, text, n);
+		g_osd_text[n] = 0;
+	}
+	LeaveCriticalSection(&g_osd_cs);
+}
+
+void swrast_overlay_draw(HDC hdc, int client_w)
+{
+	char text[256];
+	HFONT font, old_font;
+	RECT box;
+	int old_bk;
+
+	if (!InterlockedCompareExchange(&g_osd_ready, 0, 0))
+		return;
+	EnterCriticalSection(&g_osd_cs);
+	memcpy(text, g_osd_text, sizeof(text));
+	LeaveCriticalSection(&g_osd_cs);
+	if (!text[0])
+		return;
+
+	font = CreateFontA(-14, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+			   CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, "Consolas");
+	old_font = font ? (HFONT)SelectObject(hdc, font) : NULL;
+	old_bk = SetBkMode(hdc, TRANSPARENT);
+
+	box.left = 8;
+	box.top = 6;
+	box.right = client_w - 8;
+	box.bottom = 200;
+	/* Drawn twice, offset, so it stays legible over both a bright and a dark
+	 * frame. Cheaper and more robust than measuring the text and filling a
+	 * backing rectangle, which would also hide part of the picture. */
+	SetTextColor(hdc, RGB(0, 0, 0));
+	OffsetRect(&box, 1, 1);
+	DrawTextA(hdc, text, -1, &box, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK);
+	OffsetRect(&box, -1, -1);
+	SetTextColor(hdc, RGB(0, 255, 96));
+	DrawTextA(hdc, text, -1, &box, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK);
+
+	SetBkMode(hdc, old_bk);
+	if (old_font)
+		SelectObject(hdc, old_font);
+	if (font)
+		DeleteObject(font);
 }
 
 /* Companion to the colour snapshot: same dimensions, one draw index per pixel.
